@@ -7,6 +7,30 @@ It is a drafter, not a converter: it does not try to copy the PDF. The goal is a
 document where one change to a style changes every instance, and where numbering and
 cross-references still work after you edit.
 
+## Why I need this package
+
+I am a researcher writing in LaTeX, but in many cases my coauthors want an editable Word file for
+their editing and for the final submission.
+
+So I need to hand them my draft, the whole paper or just a section, in a form they can continue to
+edit: with correct styles and cross-references, which make downstream editing easy. It does not
+matter whether the page looks exactly like my PDF. Figures generated in LaTeX are converted to
+pictures and inserted into Word, so nobody has to redraw them elsewhere.
+
+Many complex LaTeX features are not supported, because they cost only a little manual editing or a
+macro in Word, while supporting them would cost a lot and make this package complex.
+
+The reference list is rendered as static text, because different scholars favour different tools:
+Zotero, EndNote, Word's own citations, or by hand. Automatic referencing is part of the downstream
+editing, not of this package.
+
+If you want to keep the exact layout, there are many other tools available. Please search for them
+first. But if you want an easily editable file to start downstream editing from, here it is.
+
+I intend to keep the package small and simple. You are welcome to fork it and make it fancier.
+
+Good luck.
+
 What you get:
 
 - Every structural element uses a named Word style (Heading 1, Body Text, Caption Table, Bibliography, ...).
