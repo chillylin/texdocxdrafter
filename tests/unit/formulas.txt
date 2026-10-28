@@ -1,0 +1,46 @@
+s_{ic} - s^{*}_{ic}
+\frac{a}{b}+\sqrt{x}
+\sqrt[3]{x^2+1}
+\text{if } x>0
+\operatorname{Var}(X)
+\mathbb{E}[X]
+\sum_{i=1}^n x_i
+\prod_{c \in C} p_c
+\int_0^\infty e^{-x}\,dx
+\rightarrow
+\begin{cases} a & x>0 \\ b & \text{else}\end{cases}
+\begin{pmatrix} a & b \\ c & d \end{pmatrix}
+\begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}
+\hat{\beta} = (X'X)^{-1}X'y
+\left( \frac{a}{b} \right)
+\left\{ x \mid x > 0 \right\}
+\bm{x}
+\boldsymbol{\beta}
+\mathrm{AUC}
+\kappa = \frac{p_o - p_e}{1 - p_e}
+\alpha \leq \beta \neq \gamma
+x \in \mathcal{X}
+\Pr(A \mid B)
+\overline{x} + \bar{y} + \tilde{z}
+\underbrace{a+b}_{c}
+\mathbb{1}\{x > 0\}
+\sigma^2_{\epsilon}
+\lim_{n \to \infty} \frac{1}{n}
+\mathbb{R}^{n \times m}
+\|x\|_2
+\log\left(\frac{p}{1-p}\right)
+\arg\max_{\theta} L(\theta)
+\widehat{\text{se}}(\hat\theta)
+\Delta s_{it} = \gamma_0 + \gamma_1 D_i + \varepsilon_{it}
+\sum_{\substack{i \in A}} x_i
+\xrightarrow{p}
+\text{Cov}(X, Y) \neq 0
+\forall x \exists y : x < y
+a \times b \div c \pm d
+\binom{n}{k}
+\mathbf{X}^{\top}\mathbf{X}
+\dots + x_n
+\frac{\partial L}{\partial \theta}
+\vec{v} \cdot \vec{w}
+\ln(1+x) \approx x
+\operatorname*{argmin}_x f(x)
