@@ -112,6 +112,61 @@ existing one. Edit it to rename Word styles, then run `build` again. Sections:
 To change fonts, spacing or colours, edit the styles in Word once, or pass your journal template with
 `--reference-doc`.
 
+## Tracked changes from review markup
+
+Revision markup in the LaTeX source becomes Word tracked changes, so a coauthor can accept or reject
+each change in Word. Define the macros and environments in your preamble as you like; only their
+effect in LaTeX matters, not their names:
+
+```latex
+\usepackage[dvipsnames]{xcolor}
+\usepackage{ulem}
+\newcommand{\add}[1]{\uline{#1}}            % underlined in the PDF  -> tracked insertion
+\newcommand{\del}[1]{\sout{#1}}             % struck out in the PDF  -> tracked deletion
+\newenvironment{addblock}{\color{NavyBlue}}{}   % colour only in the PDF -> tracked insertion
+\newenvironment{delblock}{\color{red}}{}        % colour only in the PDF -> tracked deletion
+```
+
+Inline changes:
+
+```latex
+The sample holds \del{five} \add{four} industries.
+```
+
+Block changes, for passages that `\add{...}` cannot hold (headings, labels, lists, floats, footnotes):
+
+```latex
+\begin{delblock}
+This paragraph is removed in the revision.
+
+\subsection{A heading that goes too}
+Its text, with a footnote.\footnote{Removed with it.}
+\end{delblock}
+
+\begin{addblock}
+This paragraph is new in the revision.
+\begin{itemize}
+  \item so is this list
+\end{itemize}
+\end{addblock}
+```
+
+In the PDF the environments only colour the text, so the LaTeX document compiles as usual. In the docx
+every paragraph, heading, list item, table row, caption and footnote inside `delblock` is a tracked
+deletion and inside `addblock` a tracked insertion. Accepting all changes yields the revised text;
+rejecting all yields the original.
+
+How the tool decides:
+
+- An author macro whose definition strikes out its argument (`\sout`, `\xout`) is a deletion; one that
+  underlines it (`\uline`, `\uuline`, `\uwave`) is an insertion. Other macro names work the same way.
+- The environment names `addblock` and `delblock` are the defaults of `options.revision_environments`
+  in the style map; set your own map, for example `{newtext: ins, oldtext: del}`, to use other names.
+- Text deleted inside an insertion nests as Word does. A lone space between `\del{a} \add{b}` is dropped,
+  so accepting or rejecting all changes leaves single spacing.
+- The author shown on the changes is `options.revision_author` (default `LaTeX`).
+- Set `options.revision_macros: false` to turn the detection off and keep the macros as plain text.
+
 ## What is supported
 
 - Sectioning, paragraphs, run-in `\paragraph`, appendices (flagged), quotes, verbatim, footnotes.
@@ -140,15 +195,8 @@ To change fonts, spacing or colours, edit the styles in Word once, or pass your 
 - Citations: the biblatex cite family (including `\cites` forms and natbib-style `\citet`/`\citep` with
   `natbib=true`), `\printbibliography`, `refsection`. BibTeX with natbib or plain `thebibliography` styles:
   `\bibliography{...}` is rendered by `bibtex` with the document's own `.bst` in the side compile.
-- Review markup: an author macro whose definition strikes out its argument (`\sout`, `\xout`) is a deletion,
-  one that underlines it (`\uline`, `\uuline`, `\uwave`) an insertion. Inline uses become tracked runs; an
-  argument that holds paragraphs, headings or floats becomes tracked paragraphs, footnotes included. Text
-  deleted inside an insertion nests as Word does, and a lone space between `\del{a} \add{b}` is dropped, so
-  accepting or rejecting all changes leaves single spacing.
-- Block-level review markup: `\add{...}` cannot hold headings, labels, lists or floats, because ulem's `\uline`
-  breaks on them. Wrap such passages in an environment instead, for example
-  `\newenvironment{addblock}{\color{NavyBlue}}{}`; `addblock` and `delblock` become tracked insertions and
-  deletions (headings, footnotes, lists, table rows and captions included).
+- Review markup: `\add{...}`, `\del{...}`, `addblock` and `delblock` become tracked changes; see
+  "Tracked changes from review markup" above.
 - Two columns (`twocolumn` option, `\twocolumn` in the preamble or in a local `.cls`/`.sty` such as
   `acl.sty`): the body is a two-column Word section; the title block and `table*`/`figure*` sit in
   one-column sections joined by continuous section breaks. Tables and pictures inside a column are sized
