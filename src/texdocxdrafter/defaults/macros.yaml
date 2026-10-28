@@ -118,7 +118,7 @@ macros:
   adjustbox: "{{"
   ensuremath: "{"
   title: "[{"
-  author: "{"
+  author: "[{"
   date: "{"
   affil: "[{"
   keywords: "{"

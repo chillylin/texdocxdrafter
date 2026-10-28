@@ -246,6 +246,8 @@ class Run:
 class Document(Node):
     title: list | None = None
     authors: list = field(default_factory=list)  # list of inline lists
+    author_marks: list = field(default_factory=list)  # authblk affiliation marks, parallel to authors ('' if none)
+    affils: list = field(default_factory=list)  # authblk affiliations: (mark, inline list)
     date: list | None = None
     abstract: list = field(default_factory=list)  # blocks
     keywords: list | None = None

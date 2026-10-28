@@ -227,3 +227,46 @@ Added text.
     block = next(b for b in doc.blocks if isinstance(b, RevisionBlock))
     assert block.kind == "ins" and block.macro == "addblock"
     assert isinstance(block.blocks[0], Heading) and block.blocks[0].label == "sec:new"
+
+
+def test_authblk_authors_and_affiliations(tmp_path):
+    from texdocxdrafter.parser import parse_document
+    from texdocxdrafter.parser.model import Styled, Text
+    from texdocxdrafter.preflight import preflight
+
+    src = tmp_path / "a.tex"
+    src.write_text(r"""\documentclass{article}
+\usepackage{authblk}
+\title{T}
+\author[1]{Lin Ma}
+\author[1,2]{Eduardo Schiehll}
+\affil[1]{HEC Montr\'eal}
+\affil[2]{Elsewhere}
+\begin{document}
+\maketitle
+Body.
+\end{document}
+""")
+    doc = parse_document(preflight(src, need_build_files=False))
+    assert [t.text for a in doc.authors for t in a if isinstance(t, Text)] == ["Lin Ma", "Eduardo Schiehll"]
+    assert doc.author_marks == ["1", "1,2"]
+    assert [m for m, _ in doc.affils] == ["1", "2"]
+    paras = [b for b in doc.blocks if getattr(b, "style", "") == "author"]
+    assert len(paras) == 3
+    line = paras[0].children
+    assert "".join(c.text for c in line if isinstance(c, Text)) == "Lin Ma and Eduardo Schiehll"
+    assert [c.children[0].text for c in line if isinstance(c, Styled)] == ["1", "1,2"]
+    assert paras[1].children[0].children[0].text == "1"
+    assert "Montréal" in "".join(c.text for c in paras[1].children if isinstance(c, Text))
+
+
+def test_plain_author_with_and_unchanged(tmp_path):
+    from texdocxdrafter.parser import parse_document
+    from texdocxdrafter.parser.model import Text
+    from texdocxdrafter.preflight import preflight
+
+    src = tmp_path / "b.tex"
+    src.write_text("\\documentclass{article}\n\\title{T}\\author{A One \\and B Two}\n\\begin{document}\\maketitle Body.\\end{document}\n")
+    doc = parse_document(preflight(src, need_build_files=False))
+    paras = [b for b in doc.blocks if getattr(b, "style", "") == "author"]
+    assert ["".join(c.text for c in p.children if isinstance(c, Text)) for p in paras] == ["A One", "B Two"]
