@@ -1,24 +1,57 @@
 """Graphics lookup and conversion (pdftoppm, gs) for \\includegraphics."""
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
-import subprocess
 from pathlib import Path
+
+from .. import sandbox
 
 EXTS = [".pdf", ".png", ".jpg", ".jpeg", ".eps", ".gif", ".bmp", ".tif", ".tiff", ".svg"]
 TEXT_WIDTH_IN = 6.5
 
 
-def find_graphic(name: str, srcdir: Path, graphicspath: list[str]) -> Path | None:
+MAX_PIXELS = 6000  # longest side of a rasterised page
+
+
+def find_graphic(name: str, srcdir: Path, graphicspath: list[str], roots: list[Path] | None = None) -> Path | None:
+    """Locate an \\includegraphics file; only files under ``roots`` (default: srcdir) are returned."""
+    from ..preflight import inside
+
+    roots = roots or [srcdir]
     dirs = [srcdir] + [(srcdir / g) for g in graphicspath]
     cands = [name] if Path(name).suffix.lower() in EXTS else [name + e for e in EXTS]
     for d in dirs:
         for c in cands:
             p = d / c
-            if p.is_file():
+            if p.is_file() and inside(p, roots):
                 return p
     return None
+
+
+def safe_dpi(pdf: Path, dpi: int = 300, max_px: int = MAX_PIXELS) -> int:
+    """Resolution that keeps every page of ``pdf`` within ``max_px`` on its longest side."""
+    if not shutil.which("pdfinfo"):
+        return dpi
+    r = sandbox.run(["pdfinfo", "-f", "1", "-l", "200", str(pdf)], cwd=pdf.parent, timeout=30, rw=[])
+    dims = [float(x) for pair in re.findall(r"size:\s+([0-9.]+) x ([0-9.]+)", r.stdout) for x in pair]
+    if not dims:
+        return dpi
+    longest = max(dims) / 72.0  # inches
+    if longest * dpi > max_px:
+        return max(1, int(max_px / longest))
+    return dpi
+
+
+def _cache_key(path: Path, options: str) -> str:
+    h = hashlib.sha256()
+    h.update(str(path.resolve()).encode())
+    h.update(options.encode())
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
 
 
 def to_raster(path: Path, workdir: Path) -> Path | None:
@@ -27,17 +60,19 @@ def to_raster(path: Path, workdir: Path) -> Path | None:
     if suf in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"):
         return path
     workdir.mkdir(parents=True, exist_ok=True)
-    out_base = workdir / (path.stem + "-img")
+    key = _cache_key(path, "png,300,first-page")
+    out_base = workdir / f"{path.stem}-{key}"
     out = out_base.with_suffix(".png")
-    if out.exists() and out.stat().st_mtime >= path.stat().st_mtime:
+    if out.exists():
         return out
     src = path
     if suf in (".eps", ".ps"):
         if not shutil.which("gs"):
             return None
-        tmp = workdir / (path.stem + "-eps.pdf")
-        r = subprocess.run(["gs", "-q", "-dNOPAUSE", "-dBATCH", "-dEPSCrop", "-sDEVICE=pdfwrite",
-                            f"-sOutputFile={tmp}", str(path)], capture_output=True)
+        tmp = workdir / f"{path.stem}-{key}-eps.pdf"
+        r = sandbox.run(["gs", "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-dEPSCrop", "-sDEVICE=pdfwrite",
+                         f"-sOutputFile={tmp}", str(path)], cwd=workdir, timeout=sandbox.TOOL_TIMEOUT,
+                        max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[workdir])
         if r.returncode != 0 or not tmp.exists():
             return None
         src = tmp
@@ -45,8 +80,10 @@ def to_raster(path: Path, workdir: Path) -> Path | None:
     if suf == ".pdf":
         if not shutil.which("pdftoppm"):
             return None
-        r = subprocess.run(["pdftoppm", "-r", "300", "-png", "-singlefile", "-f", "1", "-l", "1", str(src),
-                            str(out_base)], capture_output=True)
+        dpi = safe_dpi(src, 300)
+        r = sandbox.run(["pdftoppm", "-r", str(dpi), "-png", "-singlefile", "-f", "1", "-l", "1", str(src),
+                         str(out_base)], cwd=workdir, timeout=sandbox.TOOL_TIMEOUT,
+                        max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[workdir])
         return out if r.returncode == 0 and out.exists() else None
     return None
 

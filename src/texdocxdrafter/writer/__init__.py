@@ -679,7 +679,8 @@ class DocxWriter:
                 return
             self.add_picture(Path(img.path), img.width_in)
             return
-        path = gfx.find_graphic(img.name, self.pf.srcdir, self.pf.graphicspath)
+        path = gfx.find_graphic(img.name, self.pf.srcdir, self.pf.graphicspath,
+                                [self.pf.srcdir] + list(self.pf.allow_dirs))
         if path is None:
             self.audit.add("figure", f"graphic '{img.name}' not found", img.loc)
             self.add(para(self.ps("figure"), [run(f"[missing figure: {img.name}]", self.cs("todo"))]))
@@ -1042,6 +1043,7 @@ class DocxWriter:
             cp.title = "".join(_inline_text(self.doc.title))
         if self.doc.authors:
             cp.author = "; ".join("".join(_inline_text(a)) for a in self.doc.authors)
+        cp.last_modified_by = "texdocxdrafter"  # lets a later run tell its own untouched output from an edited draft
         out = Path(out)
         self.d.save(str(out))
         self.audit.info["styles used"] = len(self.used)

@@ -1,15 +1,15 @@
 """Render tikzpicture environments to PNG with one side compile (preview package, one page per picture)."""
 from __future__ import annotations
 
-import os
 import re
 import shutil
-import subprocess
 from pathlib import Path
 
+from . import sandbox
 from .audit import Audit
 from .parser.model import Document, Image, walk_tree
-from .preflight import Preflight
+from .preflight import Preflight, side_preamble
+from .writer.images import safe_dpi
 
 DPI = 300
 PREVIEW = "\\usepackage[active,tightpage]{preview}\n\\setlength\\PreviewBorder{1pt}"
@@ -22,14 +22,14 @@ def tikz_images(doc: Document) -> list[Image]:
 
 
 def build_tikz_tex(pf: Preflight, images: list[Image]) -> str:
-    out = [pf.orig_preamble.rstrip(), PREVIEW, "\\begin{document}"]
+    out = [side_preamble(pf).rstrip(), PREVIEW, "\\begin{document}"]
     for img in images:
         out.append("\\begin{preview}%s\\end{preview}" % img.tikz)
     out.append("\\end{document}")
     return "\n".join(out) + "\n"
 
 
-def render_tikz(pf: Preflight, doc: Document, audit: Audit) -> int:
+def render_tikz(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandbox.COMPILE_TIMEOUT) -> int:
     """Compile every tikzpicture of the tree and set Image.path/width_in. Returns the number rendered."""
     images = tikz_images(doc)
     if not images:
@@ -42,10 +42,8 @@ def render_tikz(pf: Preflight, doc: Document, audit: Audit) -> int:
     if pf.aux and Path(pf.aux).exists():
         # the document's own labels, so \ref inside a picture prints the LaTeX number
         shutil.copyfile(pf.aux, work / "tikz.aux")
-    env = dict(os.environ)
-    env["TEXINPUTS"] = f"{pf.srcdir}:" + env.get("TEXINPUTS", "")
-    cmd = [pf.engine, "-interaction=batchmode", f"-output-directory={work}", "-jobname=tikz", str(work / "tikz.tex")]
-    r = subprocess.run(cmd, cwd=pf.srcdir, env=env, capture_output=True, text=True, timeout=300)
+    dirs = [pf.srcdir] + list(pf.allow_dirs)
+    r = sandbox.compile_tex(pf.engine, work, "tikz", work / "tikz.tex", dirs, timeout)
     pdf = work / "tikz.pdf"
     if not pdf.exists() or pdf.stat().st_size == 0:
         log = work / "tikz.log"
@@ -56,7 +54,9 @@ def render_tikz(pf: Preflight, doc: Document, audit: Audit) -> int:
     if not shutil.which("pdftoppm"):
         audit.add("figure", "pdftoppm not found; tikzpicture(s) kept as visible text", images[0].loc)
         return 0
-    subprocess.run(["pdftoppm", "-r", str(DPI), "-png", str(pdf), str(work / "page")], capture_output=True)
+    dpi = safe_dpi(pdf, DPI)
+    sandbox.run(["pdftoppm", "-r", str(dpi), "-png", str(pdf), str(work / "page")], cwd=work,
+                timeout=sandbox.TOOL_TIMEOUT, max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[work])
     pages = sorted(work.glob("page-*.png"), key=lambda p: int(re.search(r"-(\d+)\.png$", p.name).group(1)))
     if len(pages) != len(images):
         audit.add("figure", f"tikz compile gave {len(pages)} page(s) for {len(images)} tikzpicture(s); "
@@ -66,6 +66,6 @@ def render_tikz(pf: Preflight, doc: Document, audit: Audit) -> int:
 
     for img, png in zip(images, pages):
         img.path = str(png)
-        img.width_in = DImage.from_file(str(png)).px_width / DPI
+        img.width_in = DImage.from_file(str(png)).px_width / dpi
     audit.count("tikzpicture rendered to PNG", len(images))
     return len(images)

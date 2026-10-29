@@ -6,17 +6,16 @@ A side document reuses the original preamble, typesets every citation command in
 """
 from __future__ import annotations
 
-import os
 import re
 import shutil
-import subprocess
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import sandbox
 from .audit import Audit
-from .parser.model import Bibliography, Cite, Document, Run, walk_tree
-from .preflight import Preflight
+from .parser.model import Bibliography, Document, Run, walk_tree
+from .preflight import Preflight, side_preamble
 
 OVERRIDES = r"""
 % ---- texdocxdrafter harvest overrides -------------------------------------------------------------
@@ -108,7 +107,7 @@ def build_harvest_tex(pf: Preflight, doc: Document) -> tuple[str, list[tuple[int
     walk_tree(doc, find)
     sections = sorted({c.section for c in cites} | {b.section for b in bibs} | {0})
     bibtex = any(b.bibtex is not None for b in bibs)
-    out = [pf.orig_preamble.rstrip(), OVERRIDES] + ([BIBTEX_OVERRIDES] if bibtex else []) + \
+    out = [side_preamble(pf).rstrip(), OVERRIDES] + ([BIBTEX_OVERRIDES] if bibtex else []) + \
           ["\\begin{document}", "\\raggedright"]
     bib_keys: list[tuple[int, int]] = []
     for s in sections:
@@ -129,34 +128,36 @@ def build_harvest_tex(pf: Preflight, doc: Document) -> tuple[str, list[tuple[int
     return "\n".join(out) + "\n", bib_keys
 
 
-def run_cmd(cmd: list[str], cwd: Path, env: dict, timeout: int = 300) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+def compile_harvest(pf: Preflight, tex: str, audit: Audit, timeout: int = sandbox.COMPILE_TIMEOUT) -> Path | None:
+    """Compile the harvest document in the run's private work directory.
 
-
-def compile_harvest(pf: Preflight, tex: str, audit: Audit) -> Path | None:
+    The engine runs with shell escape off and ``openout_any=p``, reads inputs from the source directory
+    (plus ``--allow-dir`` directories) and can write only into ``work``."""
     work = pf.workdir
     work.mkdir(parents=True, exist_ok=True)
     (work / "harvest.tex").write_text(tex, encoding="utf-8")
-    env = dict(os.environ)
-    env["TEXINPUTS"] = f"{pf.srcdir}:" + env.get("TEXINPUTS", "")
-    env["BIBINPUTS"] = f"{pf.srcdir}:" + env.get("BIBINPUTS", "")
+    dirs = [pf.srcdir] + list(pf.allow_dirs)
+    env = sandbox.tex_env(dirs)
     engine = pf.engine
-    base = [engine, "-interaction=batchmode", f"-output-directory={work}", "-jobname=harvest", str(work / "harvest.tex")]
-    r = run_cmd(base, pf.srcdir, env)
+
+    def tex_run():
+        return sandbox.compile_tex(engine, work, "harvest", work / "harvest.tex", dirs, timeout)
+
+    r = tex_run()
+    if r.returncode == -1:
+        audit.add("harvest", f"harvest compile aborted ({engine}): {r.stderr}")
+        return None
     if pf.uses_biblatex and shutil.which("biber"):
-        run_cmd(["biber", "--output-directory", str(work), "harvest"], pf.srcdir, env)
-        run_cmd(base, pf.srcdir, env)
-        run_cmd(base, pf.srcdir, env)
+        sandbox.run(["biber", "--output-directory", str(work), "harvest"], cwd=work, env=env, timeout=timeout, rw=[work])
+        tex_run()
+        tex_run()
     elif not pf.uses_biblatex and shutil.which("bibtex"):
-        # bibtex looks for the .aux in its working directory and for .bib/.bst files on these paths
-        benv = dict(env)
-        for var in ("BIBINPUTS", "BSTINPUTS"):
-            benv[var] = f"{pf.srcdir}:" + os.environ.get(var, "")
-        b = run_cmd(["bibtex", "harvest"], work, benv)
+        # bibtex looks for the .aux in its working directory and for .bib/.bst files on BIBINPUTS/BSTINPUTS
+        b = sandbox.run(["bibtex", "harvest"], cwd=work, env=env, timeout=timeout, rw=[work])
         for m in re.findall(r"I couldn't open (?:database|style) file (\S+)", b.stdout):
             audit.add("harvest", f"bibtex could not open {m}")
-        run_cmd(base, pf.srcdir, env)
-        run_cmd(base, pf.srcdir, env)
+        tex_run()
+        tex_run()
     log = work / "harvest.log"
     if log.exists():
         text = log.read_text(errors="replace")
@@ -301,9 +302,9 @@ def _attach_labels(entries: list[tuple[str, list[Run]]]) -> list[tuple[str, list
     return out
 
 
-def run_harvest(pf: Preflight, doc: Document, audit: Audit) -> HarvestResult:
+def run_harvest(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandbox.COMPILE_TIMEOUT) -> HarvestResult:
     tex, bib_keys = build_harvest_tex(pf, doc)
-    pdf = compile_harvest(pf, tex, audit)
+    pdf = compile_harvest(pf, tex, audit, timeout=timeout)
     res = HarvestResult(tex=pf.workdir / "harvest.tex")
     if pdf is None:
         res.log_errors.append("compile failed")
@@ -311,7 +312,7 @@ def run_harvest(pf: Preflight, doc: Document, audit: Audit) -> HarvestResult:
     if not shutil.which("pdftotext"):
         audit.add("harvest", "pdftotext not found; citations rendered as [key]")
         return res
-    txt = subprocess.run(["pdftotext", "-raw", str(pdf), "-"], capture_output=True, text=True).stdout
+    txt = sandbox.run(["pdftotext", "-raw", str(pdf), "-"], cwd=pf.workdir, timeout=60, rw=[]).stdout
     (pf.workdir / "harvest.txt").write_text(txt, encoding="utf-8")
     parsed = parse_text(txt, len(doc.cites), bib_keys, audit)
     parsed.tex = res.tex

@@ -13,7 +13,7 @@ def _preflight(args, need_build_files=True):
     from .preflight import PreflightError, preflight
 
     try:
-        return preflight(args.main, need_build_files=need_build_files)
+        return preflight(args.main, need_build_files=need_build_files, allow_dirs=getattr(args, "allow_dir", None) or ())
     except PreflightError as exc:
         print(f"texdocxdrafter: {exc}", file=sys.stderr)
         raise SystemExit(2)
@@ -26,7 +26,8 @@ def cmd_build(args) -> int:
     try:
         res = build(args.main, out=args.output, style_map=args.style_map, reference_doc=args.reference_doc,
                     link_citations=args.link_citations, keep_work=args.keep_work, no_harvest=args.no_harvest,
-                    validate_lo=args.validate_libreoffice, comments=not args.no_comments)
+                    no_tikz=args.no_tikz, validate_lo=args.validate_libreoffice, comments=args.comments,
+                    overwrite=args.overwrite, allow_dirs=args.allow_dir or (), timeout=args.timeout)
     except PreflightError as exc:
         print(f"texdocxdrafter: {exc}", file=sys.stderr)
         return 2
@@ -87,11 +88,17 @@ def cmd_harvest(args) -> int:
     from .audit import Audit
     from .parser import parse_document
 
+    import shutil
+    import tempfile
+
     pf = _preflight(args)
-    pf.workdir.mkdir(parents=True, exist_ok=True)
     audit = Audit()
     doc = parse_document(pf, audit)
-    res = harvest.run_harvest(pf, doc, audit)
+    pf.workdir = Path(tempfile.mkdtemp(prefix="texdocxdrafter-"))  # side compile in a private directory
+    try:
+        res = harvest.run_harvest(pf, doc, audit, timeout=args.timeout)
+    finally:
+        shutil.rmtree(pf.workdir, ignore_errors=True)
     for i in sorted(res.cites):
         print(f"[{i}] " + "".join(_fmt(r) for r in res.cites[i]))
     for key, entries in res.bibs.items():
@@ -131,9 +138,15 @@ def main(argv=None) -> int:
     b.add_argument("--style-map")
     b.add_argument("--reference-doc")
     b.add_argument("--link-citations", action="store_true")
-    b.add_argument("--keep-work", action="store_true")
-    b.add_argument("--no-harvest", action="store_true")
-    b.add_argument("--no-comments", action="store_true", help="do not turn LaTeX %% comments into Word comments")
+    b.add_argument("-f", "--overwrite", action="store_true",
+                   help="replace an existing output file even if it was not written by texdocxdrafter")
+    b.add_argument("--keep-work", action="store_true", help="keep intermediate files under main.texdocxdrafter/work/")
+    b.add_argument("--no-harvest", action="store_true", help="skip the citation side compile")
+    b.add_argument("--no-tikz", action="store_true", help="skip the tikzpicture side compile")
+    b.add_argument("--comments", action="store_true", help="turn LaTeX %% comments into Word comments")
+    b.add_argument("--allow-dir", action="append", metavar="DIR",
+                   help="additional directory that \\input and graphics may come from (repeatable)")
+    b.add_argument("--timeout", type=int, default=120, metavar="SECONDS", help="limit per TeX/biber run (default 120)")
     b.add_argument("--validate-libreoffice", action="store_true")
     b.set_defaults(fn=cmd_build)
 
@@ -148,6 +161,8 @@ def main(argv=None) -> int:
 
     h = sub.add_parser("harvest", help="side compile only; print citations and entries")
     h.add_argument("main")
+    h.add_argument("--allow-dir", action="append", metavar="DIR")
+    h.add_argument("--timeout", type=int, default=120, metavar="SECONDS")
     h.set_defaults(fn=cmd_harvest)
 
     c = sub.add_parser("check", help="style usage table and validation of a docx")

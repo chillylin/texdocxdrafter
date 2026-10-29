@@ -42,7 +42,7 @@ What you get:
 - A two-column LaTeX layout becomes a two-column Word layout.
 - Equations become native Word (OMML) equations.
 - `tikzpicture` environments are compiled with your TeX engine and embedded as PNG images.
-- LaTeX `%` comments in the document body become Word comments on the paragraph they annotate.
+- With `--comments`, LaTeX `%` comments in the document body become Word comments on the paragraph they annotate.
 - A report lists every construct that was dropped or approximated, with `file:line`.
 
 Pure Python plus your existing TeX installation. No pandoc, no LibreOffice, no Java.
@@ -51,7 +51,9 @@ Pure Python plus your existing TeX installation. No pandoc, no LibreOffice, no J
 
 - Python 3.12 or newer.
 - A TeX distribution with `pdflatex`/`xelatex`/`lualatex` and `biber` (used for the citation side compile).
-- `pdftotext` and `pdftoppm` (poppler-utils). `gs` (Ghostscript) is needed only for EPS figures.
+- `pdftotext`, `pdftoppm` and `pdfinfo` (poppler-utils). `gs` (Ghostscript) is needed only for EPS figures.
+- Recommended on Linux: `bwrap` (bubblewrap), which lets the side compiles run in a read-only view of the
+  file system. Without it the tool falls back to TeX's own restrictions plus a LuaTeX write guard.
 
 ## Install
 
@@ -90,6 +92,9 @@ texdocxdrafter build main.tex
 This writes `main.docx` and `main.texdocxdrafter-report.md` next to `main.tex`. Open the report first: it lists
 what needs manual attention.
 
+If `main.docx` already exists and was not written by `texdocxdrafter` (or has been saved since, for example by
+a coauthor in Word), the build stops rather than overwrite it. Pass `-o other.docx` or `--overwrite`.
+
 In Word, press `Ctrl+A` then `F9` to refresh all fields (`texdocxdrafter` also sets "update fields on open", so
 Word may ask whether to update them). After that, inserting or moving a section renumbers headings,
 captions, equations and every cross-reference.
@@ -112,10 +117,16 @@ captions, equations and every cross-reference.
 | `--style-map file.yaml` | Use this style map instead of `main.texdocxdrafter/stylemap.yaml` |
 | `--reference-doc tpl.docx` | Use a journal or house template. Style names in the style map must exist there; missing ones are created and reported |
 | `--link-citations` | Make each citation a hyperlink to its bibliography entry |
-| `--keep-work` | Keep the work directory `main.texdocxdrafter/` (harvest files, `tree.json`, images) for inspection |
+| `-f`, `--overwrite` | Replace an existing output file even if it was not written by `texdocxdrafter` |
+| `--keep-work` | Keep the intermediate files (harvest files, `tree.json`, images) under `main.texdocxdrafter/work/` |
 | `--no-harvest` | Skip the citation side compile; citations appear as `[key]` |
-| `--no-comments` | Do not turn LaTeX `%` comments into Word comments |
+| `--no-tikz` | Skip the `tikzpicture` side compile; pictures stay as visible text |
+| `--comments` | Turn LaTeX `%` comments into Word comments (off by default, since source comments are often private) |
+| `--allow-dir DIR` | Also accept `\input`, `\include` and graphics from `DIR` (repeatable). By default only files under the directory of `main.tex` are read |
+| `--timeout SECONDS` | Limit for each TeX or biber run of the side compiles (default 120) |
 | `--validate-libreoffice` | Also try to open the result with headless LibreOffice, if installed |
+
+With `--no-harvest --no-tikz` no TeX engine is run at all.
 
 ## Customising styles
 
@@ -209,7 +220,7 @@ How the tool decides:
 - TikZ: every `tikzpicture` is drawn in one side compile (the document's own preamble plus the `preview`
   package, one page per picture, labels taken from the `.aux`) and rasterised at 300 dpi. A picture inside a
   float keeps the float's font size and single spacing. If the compile fails, the source stays as visible text.
-- Comments: a comment at the end of a text line, or on its own line within a paragraph, goes on that
+- Comments (`--comments`): a comment at the end of a text line, or on its own line within a paragraph, goes on that
   paragraph; a comment line between blocks goes on the next block. Consecutive comment lines become one
   Word comment (author "LaTeX"). Comments in the preamble, inside a `tikzpicture`, and empty or decorative
   ones (`%%%%`) are skipped.
@@ -242,6 +253,28 @@ How the tool decides:
 - Colour that is not inside a recognised review macro (`{\color{X} ...}` around a section is dropped).
 - Arbitrary TeX. Anything outside the list above is kept as visible red text (style "Drafter Todo") and
   listed in the report with its source line, so the manual fix is bounded.
+
+## What the tool does to your files
+
+`texdocxdrafter` compiles parts of your document twice more (the citation harvest and the TikZ pictures)
+with your own TeX engine, because that is the only way to get biblatex's exact rendering. Those side
+compiles, and the image converters, run in a private temporary directory with shell escape disabled and
+`openout_any=p`; where bubblewrap is installed they also run in a sandbox in which the whole file system
+is read-only except that directory and TeX's font caches, with no network. LuaTeX, whose Lua `io` library
+ignores `openout_any`, additionally loads a guard that refuses file writes elsewhere. Every run is limited
+in time, CPU and output size, and the report's run summary says which sandbox was in effect. Even so, a
+TeX document is a program: convert documents you trust, or use `--no-harvest --no-tikz`.
+
+- Files are written only to the output `.docx`, its report, and `main.texdocxdrafter/` (the style map and,
+  with `--keep-work`, a `work/` directory that is replaced on the next run only if this tool created it).
+  Nothing else next to your sources is created, changed or deleted. The docx is written to a temporary name
+  and renamed into place, so an interrupted run never leaves a half-written file.
+- The output is never a source file, and an existing `.docx` not written by this tool is not overwritten
+  without `--overwrite`.
+- `\input`, `\include` and graphics are read only from the directory of `main.tex`, symlinks resolved, unless
+  you add directories with `--allow-dir`. A shared preamble in a parent directory therefore needs
+  `--allow-dir ..`.
+- Source comments stay out of the docx unless you pass `--comments`.
 
 ## Reading the report
 

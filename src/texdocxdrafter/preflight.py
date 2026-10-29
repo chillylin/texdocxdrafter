@@ -69,6 +69,7 @@ class Preflight:
     log: Path | None = None
     comments: list[TexComment] = field(default_factory=list)
     two_column: bool = False
+    allow_dirs: list[Path] = field(default_factory=list)  # directories besides srcdir that \input/graphics may use
     issues: list[str] = field(default_factory=list)
 
     @property
@@ -125,17 +126,77 @@ def _strip_comment(line: str) -> tuple[str, bool]:
     return line, False
 
 
-def _find_tex(srcdir: Path, name: str) -> Path | None:
+def inside(path: Path, roots: list[Path]) -> bool:
+    """True when ``path`` (symlinks resolved) lies in one of ``roots``."""
+    try:
+        rp = path.resolve(strict=True)
+    except OSError:
+        return False
+    for r in roots:
+        rr = r.resolve()
+        if rp == rr or rr in rp.parents:
+            return True
+    return False
+
+
+_SIDE_PATHS = re.compile(r"\\(input|include|addbibresource|bibliography|graphicspath)\s*(\[[^\]]*\])?\s*\{")
+
+
+def side_preamble(pf: "Preflight") -> str:
+    """The original preamble for a side compile that runs in a private directory.
+
+    TeX does not search TEXINPUTS for explicitly relative names (``../shared/preamble``), so such
+    \\input, \\addbibresource, \\bibliography and \\graphicspath arguments are rewritten to absolute paths
+    when the target lies in an allowed directory. Others are left as they are and fail in the side
+    compile, which the report shows."""
+    text = pf.orig_preamble
+    roots = [pf.srcdir] + list(pf.allow_dirs)
+    exts = {"input": (".tex",), "include": (".tex",), "addbibresource": (), "bibliography": (".bib",),
+            "graphicspath": ()}
+
+    def rebase(name: str, kinds) -> str:
+        name = name.strip()
+        if not (name.startswith("../") or name.startswith("./") or name.startswith("..\\")):
+            return name
+        for ext in list(kinds) + [""]:
+            cand = pf.srcdir / (name + ext)
+            if (cand.is_file() or cand.is_dir()) and inside(cand, roots):
+                return str(cand.resolve()) + ("" if ext else "")
+        return name
+
+    out = []
+    pos = 0
+    for m in _SIDE_PATHS.finditer(text):
+        inner, end = _read_balanced(text, m.end() - 1)
+        cmd = m.group(1)
+        if cmd == "graphicspath":
+            new = re.sub(r"\{([^{}]*)\}", lambda g: "{" + rebase(g.group(1), ()).rstrip("/") + "/}"
+                         if g.group(1).strip().startswith((".", "..")) else g.group(0), inner)
+        elif cmd == "bibliography":
+            new = ",".join(rebase(part, exts[cmd]) for part in inner.split(","))
+        else:
+            new = rebase(inner, exts[cmd])
+        if new != inner:
+            out.append(text[pos:m.end()] + new + "}")
+            pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _find_tex(srcdir: Path, name: str, roots: list[Path] | None = None) -> Path | str | None:
+    """Path of an \\input target, None if absent, or "outside" if it exists but is not under an allowed root."""
     name = name.strip()
+    roots = roots or [srcdir]
     for cand in (name, name + ".tex"):
         p = (srcdir / cand)
         if p.is_file():
-            return p
+            return p if inside(p, roots) else "outside"
     return None
 
 
 def _flatten_file(path: Path, srcdir: Path, stack: tuple[Path, ...], issues: list[str],
-                  comments: list[TexComment] | None = None) -> list[tuple[str, str, int]]:
+                  comments: list[TexComment] | None = None,
+                  roots: list[Path] | None = None) -> list[tuple[str, str, int]]:
     """Return pieces (text, file, line) for one file with \\input expanded and comments removed.
 
     Removed comments are appended to ``comments``, except inside environments drawn as pictures."""
@@ -193,16 +254,20 @@ def _flatten_file(path: Path, srcdir: Path, stack: tuple[Path, ...], issues: lis
             continue
         pos = 0
         for im in _INPUT.finditer(text):
-            target = _find_tex(srcdir, im.group(2))
+            target = _find_tex(srcdir, im.group(2), roots)
             if target is None:
                 issues.append(f"{shown}:{lineno}: \\{im.group(1)}{{{im.group(2)}}} not found; left in place")
+                continue
+            if target == "outside":
+                issues.append(f"{shown}:{lineno}: \\{im.group(1)}{{{im.group(2)}}} lies outside the source directory "
+                              "and was not included (allow it with --allow-dir)")
                 continue
             if target in stack or len(stack) > 20:
                 issues.append(f"{shown}:{lineno}: recursive \\input of {target.name}")
                 continue
             if im.start() > pos:
                 pieces.append((text[pos:im.start()], shown, lineno))
-            pieces.extend(_flatten_file(target, srcdir, stack + (target,), issues, comments))
+            pieces.extend(_flatten_file(target, srcdir, stack + (target,), issues, comments, roots))
             pos = im.end()
         pieces.append((text[pos:], shown, lineno))
     return pieces
@@ -270,14 +335,19 @@ def _two_column(pf: "Preflight") -> bool:
     return False
 
 
-def preflight(main: str | Path, need_build_files: bool = True) -> Preflight:
+def preflight(main: str | Path, need_build_files: bool = True, allow_dirs=()) -> Preflight:
     main = Path(main).resolve()
     if not main.is_file():
         raise PreflightError(f"{main}: no such file")
     srcdir = main.parent
+    allowed = [Path(d).resolve() for d in allow_dirs]
+    for d in allowed:
+        if not d.is_dir():
+            raise PreflightError(f"--allow-dir {d}: not a directory")
+    roots = [srcdir] + allowed
     issues: list[str] = []
     comments: list[TexComment] = []
-    pieces = _flatten_file(main, srcdir, (main,), issues, comments)
+    pieces = _flatten_file(main, srcdir, (main,), issues, comments, roots)
     text = "".join(p[0] for p in pieces)
     starts: list[int] = []
     origins: list[tuple[str, int]] = []
@@ -302,7 +372,7 @@ def preflight(main: str | Path, need_build_files: bool = True) -> Preflight:
 
     pf = Preflight(main=main, srcdir=srcdir, workdir=main.with_name(main.stem + ".texdocxdrafter"),
                    source=source, orig_preamble=orig_preamble, preamble=preamble,
-                   body=body, body_offset=body_start, issues=issues)
+                   body=body, body_offset=body_start, issues=issues, allow_dirs=allowed)
     begin_rank = bisect.bisect_right(starts, m.start()) - 1
     pf.comments = [c for c in comments if source.rank((c.file, c.line)) > begin_rank]
 
