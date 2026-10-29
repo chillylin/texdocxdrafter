@@ -165,7 +165,7 @@ class DocxWriter:
                     nf = flags | {x.kind}
                 out.extend(self.inl(x.children, frozenset(nf), link))
             elif isinstance(x, Link):
-                out.append(self.hyperlink(x, flags))
+                out.extend(self.hyperlink(x, flags))
             elif isinstance(x, Footnote):
                 out.append(self.footnote_ref(x))
             elif isinstance(x, Cite):
@@ -191,12 +191,19 @@ class DocxWriter:
                 out.append(run(str(x), self.cs("todo")))
         return out
 
-    def hyperlink(self, link: Link, flags: frozenset):
+    SAFE_SCHEMES = ("http://", "https://", "mailto:")
+
+    def hyperlink(self, link: Link, flags: frozenset) -> list:
+        """A Word hyperlink for web and mail targets; other schemes (file:, javascript:, UNC paths) stay plain text."""
+        runs = self.inl(link.children, flags, link=True)
+        if not (link.url or "").strip().lower().startswith(self.SAFE_SCHEMES):
+            self.audit.count("link with a non-web target kept as text")
+            return runs
         rid = self.d.part.relate_to(link.url, RT.HYPERLINK, is_external=True)
         h = el("w:hyperlink", {"r:id": rid})
-        for r in self.inl(link.children, flags, link=True):
+        for r in runs:
             h.append(r)
-        return h
+        return [h]
 
     # ---- citations ---------------------------------------------------------------------------
     def cite_elements(self, c: Cite) -> list:
@@ -219,7 +226,7 @@ class DocxWriter:
             if "sub" in fmt:
                 flags.add("subscript")
             if r.url:
-                els.append(self.hyperlink(Link(url=r.url, children=[Text(text=r.text)]), frozenset(flags)))
+                els.extend(self.hyperlink(Link(url=r.url, children=[Text(text=r.text)]), frozenset(flags)))
                 continue
             rs, props = self.rformat(frozenset(flags))
             if rs is None:
@@ -993,7 +1000,7 @@ class DocxWriter:
                 if "sup" in r.fmt:
                     flags.add("superscript")
                 if r.url:
-                    els.append(self.hyperlink(Link(url=r.url, children=[Text(text=r.text)]), frozenset(flags)))
+                    els.extend(self.hyperlink(Link(url=r.url, children=[Text(text=r.text)]), frozenset(flags)))
                 else:
                     els.append(self.text_run(r.text, frozenset(flags)))
             els = self.bookmark(bm_name("_wfbib_", e.key), els)

@@ -110,7 +110,8 @@ and `tikz.tex` (one page per picture), and needs their PDFs.
 
 - **With bubblewrap (`bwrap`, Linux).** The tool compiles them itself, in a sandbox in which the engine sees
   only the system and TeX directories, your document's directories (read-only) and a private work directory,
-  with no network.
+  with no network. TeX's own cache (`TEXMFVAR`) is read-only too; the run gets a throwaway one that is deleted
+  with the work directory, so a document cannot leave Lua code or a format file behind for a later compile.
 - **Without bubblewrap (macOS, Windows, Linux without it).** The tool never starts a TeX engine. It writes the
   side documents into `main.texdocxdrafter/`, finishes the docx with citations as `[key]` and pictures as
   visible text, and the report gives the exact command to compile them, of the form
@@ -121,6 +122,9 @@ and `tikz.tex` (one page per picture), and needs their PDFs.
 
   Run it, then rerun `texdocxdrafter build`: the PDFs are picked up. A side document is rewritten only when
   its content changes, so this step is needed again only after you edit the preamble, a citation or a picture.
+  The side document is your project's preamble: compile it only if you trust the project, exactly as when you
+  compile the paper itself. A PDF counts only if it is newer than a side document this tool recorded writing,
+  so a `harvest.pdf` that arrived inside an archive is ignored until you compile.
 
 BibTeX documents (`\bibliography{...}` with natbib or plain `thebibliography` styles) need no side compile:
 the `.bst` style has already typeset the entries into `main.bbl`, natbib's author-year labels are in it too,
@@ -287,15 +291,18 @@ How the tool decides:
 
 `texdocxdrafter` reads your sources and writes a docx. It does not compile your paper. biblatex citations and
 TikZ pictures need two side compiles of your own preamble (see "Side compiles"), and the tool runs them itself
-only inside bubblewrap: a sandbox in which the engine sees the system and TeX directories, your document's
-directories (read-only) and a private work directory, with no network, shell escape disabled, `openout_any=p`,
-a filtered environment and limits on time, CPU and output size. Without bubblewrap no TeX engine is started;
+only inside bubblewrap: a sandbox in which the engine sees the system, TeX and cache directories (read-only),
+your document's directories (read-only) and a private work directory holding a throwaway `TEXMFVAR`, with no
+network, shell escape disabled, `openout_any=p`, a filtered environment and limits on time, CPU and output
+size. Without bubblewrap no TeX engine is started;
 you compile the side documents yourself, exactly as you compile the paper. The report's run summary says
 which of the two happened. Image converters (poppler, Ghostscript) run under the same limits.
 
 - Files are written only to the output `.docx`, its report, and `main.texdocxdrafter/` (the style map, the hash
   registry, the side documents and, with `--keep-work`, a `work/` directory that is replaced on the next run
-  only if this tool created it).
+  only if this tool created it). `main.texdocxdrafter/` must be a real directory next to `main.tex`, and the
+  side documents are replaced only if the registry says this tool wrote them; nothing is ever written through
+  a symbolic link.
   Nothing else next to your sources is created, changed or deleted. The docx is written to a temporary name
   and renamed into place, so an interrupted run never leaves a half-written file.
 - The output and the report are never source files or symbolic links. The tool records a hash of every file
@@ -304,8 +311,14 @@ which of the two happened. Image converters (poppler, Ghostscript) run under the
   written through an exclusively created temporary file and renamed into place, and the target is checked
   again at that moment: a file that appeared or changed while the conversion ran is left alone. A file at the
   registry's path that is not a registry this tool wrote, or that is one of your sources, stops the run.
-- A reference document's own comments, and the people list that names their authors, are removed before the
-  template is used, so remarks about the template's text cannot travel into your draft.
+- A reference document is used for its styles, numbering, page setup, headers and footers only. Its comments
+  and people list, footnotes and endnotes, glossary, custom XML, custom and extended properties, thumbnail,
+  every core property, attached-template path and document variables are removed first, so nothing of the
+  template's own text or author travels into your draft.
+- Build files (`.aux`, `.bbl`, `.log`) that are symbolic links to files outside the project are refused, and
+  the TikZ side compile receives only the `\newlabel` lines of the `.aux`, never the raw file.
+- Only `http`, `https` and `mailto` targets become Word hyperlinks; `\url` and `\href` with other schemes
+  (`file:`, `javascript:`, network paths) stay plain text.
 - `\input`, `\include` and graphics are read only from the directory of `main.tex`, symlinks resolved, unless
   you add directories with `--allow-dir`. A shared preamble in a parent directory therefore needs
   `--allow-dir ..`.

@@ -303,26 +303,26 @@ def _attach_labels(entries: list[tuple[str, list[Run]]]) -> list[tuple[str, list
 
 
 def run_harvest(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandbox.COMPILE_TIMEOUT,
-                side_dir: Path | None = None) -> HarvestResult:
+                side=None) -> HarvestResult:
     """Citations and bibliography entries as runs.
 
     BibTeX documents are read from the existing ``.bbl`` with no compile. biblatex documents need the
-    harvest side compile: inside the OS sandbox when ``side_dir`` is None, otherwise the side document is
-    written to ``side_dir`` for the user to compile and the PDF they produced is used (see sidecompile)."""
+    harvest side compile: inside the OS sandbox when ``side`` is None, otherwise the side document is
+    written to ``side.dir`` for the user to compile and the PDF they produced is used (see sidecompile)."""
     if not pf.uses_biblatex and uses_bibtex(doc):
         from .bbl import harvest_from_bbl
 
         return harvest_from_bbl(pf, doc, audit)
     tex, bib_keys = build_harvest_tex(pf, doc)
-    if side_dir is None:
+    if side is None:
         pdf = compile_harvest(pf, tex, audit, timeout=timeout)
         res = HarvestResult(tex=pf.workdir / "harvest.tex")
     else:
         from .sidecompile import user_compiled_pdf
 
-        pdf = user_compiled_pdf(pf, side_dir, "harvest", tex, audit, "harvest",
+        pdf = user_compiled_pdf(pf, side, "harvest", tex, audit, "harvest",
                                 bib="biber" if pf.uses_biblatex else "bibtex")
-        res = HarvestResult(tex=side_dir / "harvest.tex")
+        res = HarvestResult(tex=side.dir / "harvest.tex")
     if pdf is None:
         res.log_errors.append("compile failed")
         return res

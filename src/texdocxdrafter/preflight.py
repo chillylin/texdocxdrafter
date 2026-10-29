@@ -402,6 +402,13 @@ def preflight(main: str | Path, need_build_files: bool = True, allow_dirs=()) ->
 
     stem = main.with_suffix("")
     pf.aux, pf.bbl, pf.bcf, pf.log = (Path(str(stem) + e) for e in (".aux", ".bbl", ".bcf", ".log"))
+    roots = [pf.srcdir] + list(pf.allow_dirs)
+    for f in (pf.aux, pf.bbl, pf.bcf, pf.log):
+        # build files are read (and the .aux is copied for the TikZ side compile): a symlink must not lead outside
+        if f.is_symlink() and not inside(f, roots):
+            raise PreflightError(f"{f.name} is a symbolic link to a file outside the project; refusing to read it")
+    if pf.workdir.is_symlink() or (pf.workdir.exists() and not pf.workdir.is_dir()):
+        raise PreflightError(f"{pf.workdir.name} must be a real directory next to {main.name}; it is a symbolic link or a file")
     pf.engine = detect_engine(pf.log, preamble)
 
     if need_build_files:

@@ -70,6 +70,9 @@ def cmd_inventory(args) -> int:
     doc = parse_document(pf, audit, sm)
     rows = inventory.census(doc, sm)
     print(inventory.render(rows))
+    if sm_path.is_symlink():
+        print(f"\n{sm_path} is a symbolic link; not written", file=sys.stderr)
+        return 2
     if not sm_path.exists():
         stylemap.dump_skeleton({name: {"count": n, "style": style} for name, n, style in rows}, sm_path)
         print(f"\nwrote {sm_path}")
@@ -96,11 +99,23 @@ def cmd_harvest(args) -> int:
     pf = _preflight(args)
     audit = Audit()
     doc = parse_document(pf, audit)
+    from .pipeline import Registry
+    from .preflight import PreflightError
+    from .sidecompile import SideDir
+
     config_dir = pf.workdir
-    side_dir = None if sandbox.have_os_sandbox() else config_dir  # no sandbox: the user compiles the side document
+    side = None
+    if not sandbox.have_os_sandbox():  # no sandbox: the user compiles the side document
+        config_dir.mkdir(parents=True, exist_ok=True)
+        side = SideDir(config_dir, Registry(config_dir, pf))
     pf.workdir = Path(tempfile.mkdtemp(prefix="texdocxdrafter-"))  # intermediate files in a private directory
     try:
-        res = harvest.run_harvest(pf, doc, audit, timeout=args.timeout, side_dir=side_dir)
+        res = harvest.run_harvest(pf, doc, audit, timeout=args.timeout, side=side)
+        if side is not None:
+            side.registry.save()
+    except PreflightError as exc:
+        print(f"texdocxdrafter: {exc}", file=sys.stderr)
+        return 2
     finally:
         shutil.rmtree(pf.workdir, ignore_errors=True)
         pf.workdir = config_dir

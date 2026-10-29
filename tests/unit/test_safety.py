@@ -673,3 +673,250 @@ def test_bibtex_document_needs_no_compile(tmp_path, monkeypatch):
     italic = re.findall(r"<w:r>(?:(?!</w:r>).)*(?:<w:i/>|w:val=\"Emphasis\")(?:(?!</w:r>).)*<w:t[^>]*>([^<]*)</w:t>", xml, re.S)
     assert "Journal of Things" in italic and "A Book About Stuff" in italic
     assert not (tmp_path / "main.texdocxdrafter" / "harvest.tex").exists()
+
+
+# ---- fourth review round --------------------------------------------------------------------------
+
+def _texmfvar() -> Path | None:
+    v = sandbox._kpse_var("TEXMFVAR")
+    return Path(v) if v and Path(v).is_dir() else None
+
+
+def test_throwaway_texmfvar_lives_in_the_work_dir(tmp_path):
+    env = sandbox.throwaway_texmfvar(tmp_path)
+    assert Path(env["TEXMFVAR"]).parent == tmp_path and Path(env["TEXMFVAR"]).is_dir()
+    assert env["TEXMFCACHE"].startswith(env["TEXMFVAR"])
+    assert not any(str(c) == env["TEXMFVAR"] for c in sandbox.ro_cache_dirs())
+
+
+@pytest.mark.skipif(not HAVE_LUALATEX, reason="lualatex not installed")
+def test_tex_cache_cannot_be_planted_from_the_sandbox(tmp_path):
+    """N1: a document must not leave code in the user's TEXMFVAR, where a later ordinary compile would run it."""
+    if not sandbox.have_os_sandbox():
+        pytest.skip("bubblewrap not available")
+    real = _texmfvar()
+    if real is None:
+        pytest.skip("no TEXMFVAR")
+    planted = real / f"texdocxdrafter-planted-{os.getpid()}.lua"
+    work = tmp_path / "work"
+    work.mkdir()
+    tex = work / "plant.tex"
+    tex.write_text(r"""\documentclass{article}
+\begin{document}
+\directlua{
+  local f = io.open("%s", "w") if f then f:write("evil") f:close() end
+  local v = os.getenv("TEXMFVAR") or "" texio.write_nl("TEXMFVAR-SEEN:" .. v)
+  local g = io.open(v .. "/planted-in-throwaway.lua", "w") if g then g:write("ok") g:close() end
+}
+x
+\end{document}
+""" % planted)
+    try:
+        r = sandbox.compile_tex("lualatex", work, "plant", tex, [work], timeout=180)
+        assert r.returncode != -1, r.stderr
+        log = (work / "plant.log").read_text(errors="replace").replace("\n", "")  # the log wraps long lines
+        assert not planted.exists()
+        assert "TEXMFVAR-SEEN:" + str(work / ".texmfvar") in log  # the engine saw the throwaway cache
+        assert (work / ".texmfvar" / "planted-in-throwaway.lua").exists()  # writes there are fine and die with the run
+    finally:
+        if planted.exists():
+            planted.unlink()
+
+
+def test_symlinked_build_files_outside_the_project_are_refused(tmp_path):
+    """N2: main.aux -> /somewhere/secret must not be copied into the TikZ side compile."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRETTOKEN42")
+    src = proj / "main.tex"
+    src.write_text(DOC)
+    os.symlink(secret, proj / "main.aux")
+    with pytest.raises(PreflightError, match="symbolic link"):
+        preflight(src, need_build_files=False)
+    # a symlink inside the project is fine
+    (proj / "main.aux").unlink()
+    (proj / "real.aux").write_text("\\relax\n")
+    os.symlink(proj / "real.aux", proj / "main.aux")
+    preflight(src, need_build_files=False)
+
+
+def test_tikz_gets_only_the_labels_of_the_aux(tmp_path):
+    from texdocxdrafter.tikz import aux_labels
+
+    src = _write(tmp_path)
+    src.with_suffix(".aux").write_text("\\relax\n\\@writefile{toc}{SECRET LINE}\n\\newlabel{fig:a}{{1}{2}}\n\\gdef\\x{SECRET}\n")
+    pf = preflight(src, need_build_files=False)
+    assert aux_labels(pf) == "\\newlabel{fig:a}{{1}{2}}\n"
+
+
+def _template_with_private_parts(path: Path) -> None:
+    """A reference document carrying a footnote, custom and extended properties, a thumbnail and core properties."""
+    import docx
+
+    d = docx.Document()
+    d.add_paragraph("template text")
+    cp = d.core_properties
+    cp.title, cp.author, cp.subject, cp.keywords, cp.category, cp.comments = (
+        "TPL-TITLE", "TPL-AUTHOR", "TPL-SUBJECT", "TPL-KEYWORDS", "TPL-CATEGORY", "TPL-COMMENT")
+    d.save(str(path))
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    footnotes = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:footnotes xmlns:w="{W}">'
+                 '<w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>'
+                 '<w:footnote w:id="1"><w:p><w:r><w:t>PRIVATE-FOOTNOTE</w:t></w:r></w:p></w:footnote></w:footnotes>')
+    custom = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" '
+              'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+              '<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="Client"><vt:lpwstr>PRIVATE-CUSTOM</vt:lpwstr></property>'
+              '</Properties>')
+    tmp = path.with_suffix(".tmp")
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        has_thumb = "docProps/thumbnail.jpeg" in zin.namelist()
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "docProps/thumbnail.jpeg":
+                data = b"PRIVATE-THUMB"
+            if item.filename == "[Content_Types].xml":
+                data = data.replace(b"</Types>", (
+                    b'<Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/>'
+                    b'<Override PartName="/docProps/custom.xml" ContentType="application/vnd.openxmlformats-officedocument.custom-properties+xml"/>'
+                    b'<Default Extension="jpeg" ContentType="image/jpeg"/></Types>'))
+            elif item.filename == "word/_rels/document.xml.rels":
+                data = data.replace(b"</Relationships>", (
+                    b'<Relationship Id="rIdFn" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/></Relationships>'))
+            elif item.filename == "_rels/.rels":
+                data = data.replace(b"</Relationships>", (
+                    b'<Relationship Id="rIdCu" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties" Target="docProps/custom.xml"/>'
+                    + (b"" if has_thumb else b'<Relationship Id="rIdTh" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail" Target="docProps/thumbnail.jpeg"/>')
+                    + b'</Relationships>'))
+            elif item.filename == "docProps/app.xml":
+                data = data.replace(b"</Properties>", b"<Company>PRIVATE-COMPANY</Company></Properties>")
+            zout.writestr(item, data)
+        zout.writestr("word/footnotes.xml", footnotes)
+        zout.writestr("docProps/custom.xml", custom)
+        if not has_thumb:
+            zout.writestr("docProps/thumbnail.jpeg", b"PRIVATE-THUMB")
+    tmp.replace(path)
+
+
+def test_reference_doc_private_parts_are_stripped(tmp_path):
+    """N3: nothing of the template's own content or author survives; one footnotes part; valid package."""
+    tpl = tmp_path / "template.docx"
+    _template_with_private_parts(tpl)
+    z = zipfile.ZipFile(tpl)
+    assert b"PRIVATE-FOOTNOTE" in z.read("word/footnotes.xml") and "docProps/thumbnail.jpeg" in z.namelist()
+
+    src = _write(tmp_path, DOC.replace("Hello world.", r"Hello world\footnote{paper note}."))
+    res = build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    z = zipfile.ZipFile(tmp_path / "main.docx")
+    names = z.namelist()
+    assert names.count("word/footnotes.xml") == 1
+    assert "docProps/custom.xml" not in names and "docProps/thumbnail.jpeg" not in names
+    blob = b"".join(z.read(n) for n in names)
+    for secret in (b"PRIVATE-FOOTNOTE", b"PRIVATE-CUSTOM", b"PRIVATE-THUMB", b"PRIVATE-COMPANY", b"TPL-TITLE",
+                   b"TPL-AUTHOR", b"TPL-SUBJECT", b"TPL-KEYWORDS", b"TPL-CATEGORY", b"TPL-COMMENT"):
+        assert secret not in blob, secret
+    assert b"paper note" in z.read("word/footnotes.xml")
+
+
+def test_symlinked_config_dir_is_refused(tmp_path):
+    """N4: main.texdocxdrafter -> elsewhere must not receive any file."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    victim = tmp_path / "victimdir"
+    victim.mkdir()
+    (victim / "harvest.tex").write_text("mine")
+    src = proj / "main.tex"
+    src.write_text(DOC)
+    src.with_suffix(".aux").write_text("\\relax\n")
+    os.symlink(victim, proj / "main.texdocxdrafter")
+    with pytest.raises(PreflightError, match="real directory"):
+        build(src, no_harvest=True, log=lambda *_: None)
+    assert sorted(p.name for p in victim.iterdir()) == ["harvest.tex"]
+    assert (victim / "harvest.tex").read_text() == "mine"
+
+
+CITING_DOC = r"""\documentclass{article}
+\usepackage{biblatex}
+\addbibresource{refs.bib}
+\begin{document}
+Text \cite{knuth84}.
+\printbibliography
+\end{document}
+"""
+
+
+def test_foreign_side_document_is_not_replaced_and_shipped_pdf_is_not_trusted(tmp_path, monkeypatch):
+    monkeypatch.setitem(sandbox._disabled, "bwrap", True)
+    src = _write(tmp_path, CITING_DOC)
+    src.with_suffix(".bbl").write_text("% fake\n")
+    (tmp_path / "refs.bib").write_text(BIB)
+    cfg = tmp_path / "main.texdocxdrafter"
+    cfg.mkdir()
+    (cfg / "harvest.tex").write_text("someone else's file")
+    with pytest.raises(PreflightError, match="not written by texdocxdrafter"):
+        build(src, log=lambda *_: None)
+    assert (cfg / "harvest.tex").read_text() == "someone else's file"
+    (cfg / "harvest.tex").unlink()
+    # a harvest.tex with exactly our content plus a PDF, shipped in an archive without our registry
+    build(src, log=lambda *_: None)
+    ours = (cfg / "harvest.tex").read_text()
+    (cfg / "outputs.json").unlink()
+    time.sleep(0.05)
+    (cfg / "harvest.pdf").write_bytes(b"%PDF-1.4 not really")
+    res = build(src, overwrite=True, log=lambda *_: None)  # overwrite: without the registry our own docx counts as foreign
+    msgs = "\n".join(e.message for e in res.audit.entries)
+    assert "for you to compile" in msgs  # the shipped PDF was not used
+    assert (cfg / "harvest.tex").read_text() == ours
+    assert (cfg / "harvest.tex").stat().st_mtime >= (cfg / "harvest.pdf").stat().st_mtime
+
+
+def test_compile_command_quotes_paths(tmp_path):
+    """N5: a project directory named to inject shell commands is printed harmlessly."""
+    import shlex
+    import subprocess
+
+    from texdocxdrafter.sidecompile import compile_command
+
+    marker = tmp_path / "INJECTED"
+    proj = tmp_path / "proj$(touch INJECTED) it's"
+    proj.mkdir()
+    src = proj / "main.tex"
+    src.write_text(DOC)
+    pf = preflight(src, need_build_files=False)
+    cmd = compile_command(pf, proj / "main.texdocxdrafter", "harvest", "biber")
+    tokens = shlex.split(cmd)
+    assert tokens[:2] == ["cd", str(proj / "main.texdocxdrafter")]
+    assert any(t.startswith("TEXINPUTS=") and t.endswith(f"{proj}:") for t in tokens)
+    subprocess.run(cmd.split(" && ")[0], shell=True, cwd=tmp_path, capture_output=True, timeout=30)  # just the cd part
+    assert not marker.exists()
+
+
+def test_inventory_does_not_write_through_a_dangling_symlink(tmp_path, capsys):
+    """N6: stylemap.yaml -> missing target must not create that target."""
+    from texdocxdrafter import cli
+    from texdocxdrafter.stylemap import dump_skeleton
+
+    src = _write(tmp_path)
+    cfg = tmp_path / "main.texdocxdrafter"
+    cfg.mkdir()
+    victim = tmp_path / "victim-created-by-inventory"
+    os.symlink(victim, cfg / "stylemap.yaml")
+    assert cli.main(["inventory", str(src)]) == 2
+    assert not victim.exists()
+    with pytest.raises(FileExistsError):
+        dump_skeleton({}, cfg / "stylemap.yaml")
+    assert not victim.exists()
+
+
+def test_only_web_and_mail_links_become_hyperlinks(tmp_path):
+    src = _write(tmp_path, DOC.replace("Hello world.", r"See \url{https://ok.example/x}, \href{mailto:a@b.c}{mail}, "
+                                                        r"\url{file:///etc/passwd} and \href{javascript:alert(1)}{click}."))
+    build(src, no_harvest=True, log=lambda *_: None)
+    z = zipfile.ZipFile(tmp_path / "main.docx")
+    rels = z.read("word/_rels/document.xml.rels").decode()
+    assert "https://ok.example/x" in rels and "mailto:a@b.c" in rels
+    assert "file:" not in rels and "javascript:" not in rels
+    xml = z.read("word/document.xml").decode()
+    assert "file:///etc/passwd" in xml and "click" in xml  # kept as visible text

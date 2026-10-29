@@ -113,7 +113,7 @@ def build_reference(sm: dict, template: str | Path | None = None, audit: Audit |
         if child.tag != qn("w:sectPr"):
             body.remove(child)
     if user:
-        _drop_comments(doc)
+        _scrub_template(doc)
 
     paragraph_names = {v for k, v in sm["paragraph"].items() if k != "heading"} | {f"{sm['paragraph']['heading']} {i}" for i in range(1, 10)}
     char_names = set(sm["character"].values())
@@ -158,24 +158,57 @@ def build_reference(sm: dict, template: str | Path | None = None, audit: Audit |
     return doc, nm, {"user_template": user, "missing": missing}
 
 
-_COMMENT_RELS = ("/comments", "/commentsExtended", "/commentsIds", "/commentsExtensible", "/people")
-_COMMENT_MARKS = ("w:commentRangeStart", "w:commentRangeEnd", "w:commentReference")
+# parts of a user template that carry its content or its author's data rather than its styles
+_DOC_RELS = ("/comments", "/commentsExtended", "/commentsIds", "/commentsExtensible", "/people",
+             "/footnotes", "/endnotes", "/glossaryDocument", "/customXml")
+_PKG_RELS = ("/custom-properties", "/thumbnail")
+_COMMENT_MARKS = ("w:commentRangeStart", "w:commentRangeEnd", "w:commentReference", "w:footnoteReference",
+                  "w:endnoteReference")
+_APP_XML = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            b'<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+            b'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+            b'<Application>Microsoft Office Word</Application></Properties>')
 
 
-def _drop_comments(doc) -> None:
-    """Remove the template's comment parts (and the people list that names their authors) and any comment
-    markers left in headers, footers or notes. The template's body is gone, so its comments, often private
-    remarks about removed text, must not travel into the generated document."""
+def _scrub_template(doc) -> None:
+    """Keep only what a reference document is for, its styles, numbering, page setup, headers and footers.
+
+    Everything that belongs to the template's own text or its author goes: comments and the people list,
+    footnotes and endnotes (the body that referenced them is gone; the writer makes its own footnotes part),
+    the glossary, custom XML, custom and extended properties, the thumbnail of its first page, every core
+    property, the attached-template path and document variables in settings."""
     part = doc.part
     for rid, rel in list(part.rels.items()):
-        if rel.reltype.endswith(_COMMENT_RELS):
+        if rel.reltype.endswith(_DOC_RELS):
             del part.rels[rid]
-    for other in part.package.iter_parts():
+    pkg = part.package
+    for rid, rel in list(pkg.rels.items()):
+        if rel.reltype.endswith(_PKG_RELS):
+            del pkg.rels[rid]
+        elif rel.reltype.endswith("/extended-properties"):
+            rel.target_part._blob = _APP_XML
+    for other in pkg.iter_parts():
         el = getattr(other, "element", None)
         if el is None or not hasattr(el, "iter"):
             continue
         for mark in [e for tag in _COMMENT_MARKS for e in el.iter(qn(tag))]:
             mark.getparent().remove(mark)
+    settings = doc.settings.element
+    for tag in ("w:attachedTemplate", "w:docVars"):
+        for e in settings.findall(qn(tag)):
+            settings.remove(e)
+    spart = doc.part.part_related_by("http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings")
+    for rid, rel in list(spart.rels.items()):
+        if rel.reltype.endswith("/attachedTemplate"):
+            del spart.rels[rid]
+    core = doc.core_properties._element
+    for child in list(core):
+        core.remove(child)
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    doc.core_properties.created = now
+    doc.core_properties.modified = now
 
 
 def _numbering(doc, user: bool) -> NumberingManager:

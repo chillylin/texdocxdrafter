@@ -26,6 +26,7 @@ from .parser import parse_document
 from .parser.model import to_json
 from .preflight import Preflight, PreflightError, preflight
 from .resolve import resolve
+from .sidecompile import SideDir
 from .validate import CheckResult, check_docx
 from .writer import DocxWriter
 
@@ -173,9 +174,27 @@ def _registry_vet(config_dir: Path, pf: Preflight) -> Path:
     return path
 
 
-def _registry_save(path: Path, reg: dict, snapshot: str | None) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    commit_file(path, json.dumps(reg, indent=1).encode("utf-8"), snapshot, "hash registry")
+class Registry:
+    """The hash registry of ``<main>.texdocxdrafter/outputs.json``: every file the tool wrote, by sha256.
+
+    ``save()`` may be called several times in a run (after the side documents, at the end); each save
+    refuses if something else changed the file meanwhile."""
+
+    def __init__(self, config_dir: Path, pf: Preflight):
+        self.path = _registry_vet(config_dir, pf)
+        self.data = _registry_load(config_dir)
+        self.snapshot = _snapshot(self.path)
+
+    def owns(self, path) -> bool:
+        return _is_own_output(Path(path), self.data)
+
+    def record(self, path) -> None:
+        self.data[str(path)] = _sha256(Path(path))
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        commit_file(self.path, json.dumps(self.data, indent=1).encode("utf-8"), self.snapshot, "hash registry")
+        self.snapshot = _sha256(self.path)
 
 
 def _is_own_output(path: Path, reg: dict) -> bool:
@@ -301,20 +320,20 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
     if reference_doc:
         sm["options"]["reference_doc"] = str(reference_doc)
     reference_doc = reference_doc or sm["options"].get("reference_doc")
-    reg_path = _registry_vet(config_dir, pf)
-    reg = _registry_load(config_dir)
+    registry = Registry(config_dir, pf)
+    reg = registry.data
     out = output_path(pf, out, overwrite, reg)
     report = vet_target(report_path(out), "report", pf, reg, overwrite)
     # what the vetted targets look like now; the commit at the end refuses if anything changed them meanwhile
-    snaps = {out: _snapshot(out), report: _snapshot(report), reg_path: _snapshot(reg_path)}
+    snaps = {out: _snapshot(out), report: _snapshot(report)}
     for issue in pf.issues:
         audit.add("preflight", issue)
     audit.info["engine"] = pf.engine
     audit.info["document class"] = pf.docclass
     # without an OS sandbox the tool runs no TeX engine: side documents go to the config dir for the user to compile
-    side_dir = None if sandbox.have_os_sandbox() else config_dir
+    side = None if sandbox.have_os_sandbox() else SideDir(config_dir, registry)
     audit.info["sandbox"] = ("bubblewrap (only system, TeX and source directories visible; no network) plus TeX restrictions"
-                             if side_dir is None else
+                             if side is None else
                              f"none (no bubblewrap): no TeX engine was run; side documents are written to {config_dir.name}/ "
                              "for you to compile")
     if pf.numberwithin:
@@ -338,7 +357,7 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
         else:
             log("harvesting citations with biblatex (side compile)" if pf.uses_biblatex else
                 f"reading citations from {pf.bbl.name}")
-            hv = harvest_mod.run_harvest(pf, doc, audit, timeout=timeout, side_dir=side_dir)
+            hv = harvest_mod.run_harvest(pf, doc, audit, timeout=timeout, side=side)
             audit.info["harvest"] = f"{len(hv.cites)}/{len(doc.cites)} citations, " \
                                     f"{sum(len(v) for v in hv.bibs.values())} bibliography entries"
         pictures = tikz_mod.tikz_images(doc)
@@ -346,7 +365,9 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
             audit.add("figure", f"{len(pictures)} tikzpicture(s) kept as visible text (--no-tikz)", pictures[0].loc)
         elif pictures:
             log("rendering tikzpicture environments")
-            tikz_mod.render_tikz(pf, doc, audit, timeout=timeout, side_dir=side_dir)
+            tikz_mod.render_tikz(pf, doc, audit, timeout=timeout, side=side)
+        if side is not None:
+            registry.save()  # the side documents are recorded even if the rest of the run fails
         res = resolve(doc, pf, audit, hv)
 
         log(f"writing {out.name}")
@@ -365,7 +386,7 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
         commit_file(report, audit.render(pf.main.name, stylemap=sm, style_usage=dict(chk.paragraph_styles)).encode("utf-8"),
                     snaps[report], "report")
         reg[str(report)] = _sha256(report)
-        _registry_save(reg_path, reg, snaps[reg_path])
+        registry.save()
     finally:
         pf.workdir = config_dir
         if keep_work:

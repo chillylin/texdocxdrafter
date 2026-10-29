@@ -3,7 +3,9 @@ r"""Run external tools (TeX engines, biber, poppler, ghostscript) with limits.
 Every subprocess gets a wall-clock timeout, a CPU-time limit and a cap on the size of files it may
 write, and a filtered environment. Where bubblewrap (``bwrap``) is available, tools run in a mount
 namespace that contains only the system and TeX directories (read-only), the document's input
-directories (read-only) and the run's work directory plus TeX's caches (writable), with no network. TeX
+directories (read-only) and the run's work directory (writable), with no network. TeX's own cache
+(TEXMFVAR, where LuaTeX keeps Lua font caches and formats may live) is never writable: each run gets a
+throwaway TEXMFVAR inside its work directory, so nothing a document plants survives the run. TeX
 engines additionally run with shell escape disabled and ``openout_any=p``; LuaTeX, whose Lua ``io``
 library ignores ``openout_any``, also loads a small init script that refuses file writes outside the
 allowed directories.
@@ -62,22 +64,36 @@ def have_os_sandbox() -> bool:
     return not _disabled["bwrap"] and _bwrap() is not None
 
 
-@functools.lru_cache(maxsize=1)
-def cache_dirs() -> tuple[Path, ...]:
-    """Directories TeX tools legitimately write to besides the work directory: font and format caches."""
-    out: list[Path] = []
+@functools.lru_cache(maxsize=4)
+def _kpse_var(name: str) -> str:
     try:
-        r = subprocess.run(["kpsewhich", "-var-value", "TEXMFVAR"], capture_output=True, text=True, timeout=20)
-        var = Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+        r = subprocess.run(["kpsewhich", "-var-value", name], capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired):
-        var = None
-    if var:
-        var.mkdir(parents=True, exist_ok=True)
-        out.append(var)
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+@functools.lru_cache(maxsize=1)
+def ro_cache_dirs() -> tuple[Path, ...]:
+    """The user's TeX and fontconfig caches: visible to a run read-only, so existing font databases are
+    found, but never writable (a document could plant Lua code or a format file that later runs outside)."""
+    out: list[Path] = []
+    var = _kpse_var("TEXMFVAR")
+    if var and Path(var).is_dir():
+        out.append(Path(var))
     fc = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "fontconfig"
     if fc.is_dir():
         out.append(fc)
     return tuple(out)
+
+
+def throwaway_texmfvar(work: Path) -> dict:
+    """Environment that points TEXMFVAR at a fresh directory inside ``work``; the real caches stay readable
+    through TEXMFCACHE, so LuaTeX's font database is still found but anything written lands in ``work``."""
+    var = Path(work) / ".texmfvar"
+    var.mkdir(parents=True, exist_ok=True)
+    real = _kpse_var("TEXMFCACHE").replace(";", ":")
+    return {"TEXMFVAR": str(var), "TEXMFCACHE": str(var) + (":" + real if real else "")}
 
 
 SYSTEM_RO = ("/usr", "/lib", "/lib32", "/lib64", "/bin", "/sbin", "/etc", "/opt", "/var/lib/texmf",
@@ -113,7 +129,7 @@ def filtered_env(env: dict | None) -> dict:
 
 
 def _wrap(cmd: list[str], rw: list[Path], ro: list[Path]) -> list[str]:
-    """bubblewrap: system and TeX directories read-only, the inputs read-only, ``rw`` writable, nothing else visible."""
+    """bubblewrap: system, TeX and cache directories read-only, the inputs read-only, ``rw`` writable, nothing else visible."""
     exe = _bwrap() if not _disabled["bwrap"] else None
     if not exe:
         return cmd
@@ -141,10 +157,11 @@ def run(cmd: list[str], cwd: Path | str, env: dict | None = None, timeout: int =
     directories, the ``ro`` inputs and the ``rw`` directories, and may write only to the latter."""
     env = filtered_env(env)
     if rw is not None:
-        cmd = _wrap(cmd, list(rw) + list(cache_dirs()), list(ro or []))
+        cmd = _wrap(cmd, list(rw), list(ro or []) + list(ro_cache_dirs()))
         if rw:
             for var in ("TMPDIR", "TEMP", "TMP"):
                 env[var] = str(rw[0])
+            env.update(throwaway_texmfvar(Path(rw[0])))
     kw = dict(cwd=str(cwd), env=env, capture_output=True, text=True, errors="replace", timeout=timeout,
               stdin=subprocess.DEVNULL)
     if os.name == "posix":
@@ -236,7 +253,7 @@ def lua_guard(work: Path, allowed: list[Path]) -> Path:
 def tex_cmd(engine: str, work: Path, jobname: str, texfile: Path) -> list[str]:
     cmd = [engine, "-no-shell-escape", "-interaction=batchmode"]
     if "lua" in Path(engine).name:
-        cmd.append(f"--lua={lua_guard(work, [work, *cache_dirs()])}")
+        cmd.append(f"--lua={lua_guard(work, [work])}")
     cmd += [f"-output-directory={work}", f"-jobname={jobname}", str(texfile)]
     return cmd
 

@@ -121,10 +121,14 @@ def load(path: str | Path | None) -> dict:
 
 
 def dump_skeleton(constructs: dict, path: str | Path) -> None:
-    """Write a stylemap skeleton. Never overwrites an existing file."""
+    """Write a stylemap skeleton. Never overwrites an existing file and never writes through a symlink."""
+    import os
+
     path = Path(path)
-    if path.exists():
-        raise FileExistsError(path)
+    if path.is_symlink() or path.exists():
+        raise FileExistsError(f"{path} exists" + (" (a symbolic link)" if path.is_symlink() else ""))
     data = default_map()
     data["constructs"] = constructs
-    path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))

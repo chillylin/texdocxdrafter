@@ -29,12 +29,20 @@ def build_tikz_tex(pf: Preflight, images: list[Image]) -> str:
     return "\n".join(out) + "\n"
 
 
+def aux_labels(pf: Preflight) -> str:
+    """The ``\\newlabel`` lines of the main document's .aux, and nothing else (never the raw file)."""
+    if not pf.aux or not Path(pf.aux).is_file():
+        return ""
+    text = Path(pf.aux).read_text(encoding="utf-8", errors="replace")
+    return "".join(l if l.endswith("\n") else l + "\n" for l in text.splitlines(True) if l.startswith("\\newlabel"))
+
+
 def render_tikz(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandbox.COMPILE_TIMEOUT,
-                side_dir: Path | None = None) -> int:
+                side=None) -> int:
     """Compile every tikzpicture of the tree and set Image.path/width_in. Returns the number rendered.
 
-    With ``side_dir`` the side document is written there for the user to compile (no OS sandbox here)
-    and the PDF they produced is used; see sidecompile."""
+    With ``side`` (a sidecompile.SideDir) the side document is written there for the user to compile (no OS
+    sandbox here) and the PDF they produced is used; see sidecompile."""
     images = tikz_images(doc)
     if not images:
         return 0
@@ -43,21 +51,19 @@ def render_tikz(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandb
     for old in work.glob("page-*.png"):
         old.unlink()
     tex = build_tikz_tex(pf, images)
-    aux_ok = bool(pf.aux) and Path(pf.aux).exists()
-    if side_dir is not None:
+    labels = aux_labels(pf)  # only the \newlabel lines of the document's .aux: \ref inside a picture prints the LaTeX number
+    if side is not None:
         from .sidecompile import user_compiled_pdf
 
-        # the document's own .aux goes next to the side document, so \ref inside a picture prints the LaTeX number
-        pdf = user_compiled_pdf(pf, side_dir, "tikz", tex, audit, "figure",
-                                extra={"tikz.aux": Path(pf.aux)} if aux_ok else None)
+        pdf = user_compiled_pdf(pf, side, "tikz", tex, audit, "figure", extra={"tikz.aux": labels} if labels else None)
         if pdf is None:
             audit.add("figure", f"{len(images)} tikzpicture(s) kept as visible text until the side document is compiled",
                       images[0].loc)
             return 0
     else:
         (work / "tikz.tex").write_text(tex, encoding="utf-8")
-        if aux_ok:
-            shutil.copyfile(pf.aux, work / "tikz.aux")
+        if labels:
+            (work / "tikz.aux").write_text(labels, encoding="utf-8")
         dirs = [pf.srcdir] + list(pf.allow_dirs)
         r = sandbox.compile_tex(pf.engine, work, "tikz", work / "tikz.tex", dirs, timeout)
         pdf = work / "tikz.pdf"
