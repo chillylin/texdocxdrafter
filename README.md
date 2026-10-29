@@ -1,33 +1,33 @@
 # TeX-DOCX Drafter (`texdocxdrafter`)
 
-Drafts a clean, style-mapped Word document (`.docx`) from a compiled LaTeX paper, for coauthors who
+Drafts a clean, style-mapped Word document (`.docx`) from a LaTeX paper, for coauthors who
 edit in Word.
 
-It is a drafter, not a converter: it does not try to copy the PDF. The goal is an editable base
-document where one change to a style changes every instance, and where numbering and
-cross-references still work after you edit.
+It is a drafter, not a converter: it does not replicate the PDF. The goal is an editable base
+document with proper style, auto-numbering and cross-references.
 
-## Why I need this package
+## Why I make this package
 
-I am a researcher writing in LaTeX, but in many cases my coauthors want an editable Word file for
+As a researcher writing in LaTeX, I frequently encounter coauthors wanting an editable Word file for
 their editing and for the final submission.
 
 So I need to hand them my draft, the whole paper or just a section, in a form they can continue to
-edit: with correct styles and cross-references, which make downstream editing easy. It does not
-matter whether the page looks exactly like my PDF. Figures generated in LaTeX are converted to
-pictures and inserted into Word, so nobody has to redraw them elsewhere.
+edit: not just plain texts. 
+It does not matter whether the page looks exactly like my PDF. 
+Also, figures generated in LaTeX are converted to pictures and inserted into Word, so nobody has to redraw them elsewhere.
 
 Many complex LaTeX features are not supported, because they cost only a little manual editing or a
-macro in Word, while supporting them would cost a lot and make this package complex.
+macro in Microsoft Word, while supporting them would make this package complex.
 
 The reference list is rendered as static text, because different scholars favour different tools:
-Zotero, EndNote, Word's own citations, or by hand. Automatic referencing is part of the downstream
-editing, not of this package.
+Zotero, EndNote, Word's own citations, or static text. 
+Automatic referencing is part of the downstream editing.
 
+If you want an easily editable file to start downstream editing from, here it is. 
 If you want to keep the exact layout, there are many other tools available. Please search for them
-first. But if you want an easily editable file to start downstream editing from, here it is.
+first.
 
-I intend to keep the package small and simple. You are welcome to fork it and make it fancier.
+I intend to keep the package small and simple. You are welcome to fork it and make it fancier. 
 
 Good luck.
 
@@ -56,12 +56,18 @@ Pure Python plus your existing TeX installation. No pandoc, no LibreOffice, no J
 ## Install
 
 ```
-python3 -m venv .venv
-.venv/bin/pip install -e .
+pip install texdocxdrafter
+```
+
+Or, to get the command without managing a virtual environment, with [pipx](https://pipx.pypa.io/):
+
+```
+pipx install texdocxdrafter
 ```
 
 This installs the `texdocxdrafter` command (also runnable as `python -m texdocxdrafter.cli`).
-The name is `tex` + `docx` + `drafter`; PyPI treats `tex-docx-drafter` as the same project.
+The name is `tex` + `docx` + `drafter`; `pip install tex-docx-drafter` resolves to the same package.
+To work on the code itself, see Development at the end.
 
 ## Before you run it
 
@@ -269,3 +275,4 @@ python3 -m venv .venv
 
 The unit tests in `tests/unit` are self-contained. End-to-end checks on real documents are run outside
 this repository, since the test corpora are not shipped.
+
