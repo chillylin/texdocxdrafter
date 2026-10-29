@@ -1599,3 +1599,71 @@ def test_control_characters_do_not_crash_the_writer(tmp_path):
     res = build(src, no_harvest=True, log=lambda *_: None)
     assert res.check.ok, res.check.errors
     assert "bad  char" in _docx_xml(tmp_path / "main.docx") or "bad char" in _docx_xml(tmp_path / "main.docx")
+
+
+# ---- ninth review round --------------------------------------------------------------------------
+
+LUA_RECOVER = r"""\documentclass{article}
+\begin{document}
+\directlua{
+  local dbg = require("debug")
+  texio.write_nl("GETUPVALUE:" .. tostring(dbg.getupvalue) .. ":" .. tostring(package.loaded["debug"] == debug))
+  local recovered
+  if dbg.getupvalue then
+    for i = 1, 20 do
+      local name, val = dbg.getupvalue(io.open, i)
+      if name == "io_open" then recovered = val end
+    end
+  end
+  if recovered then
+    local f = recovered("%(victim)s", "w") if f then f:write("pwned") f:close() end
+  end
+  local e1, m1 = os.execute("touch %(marker)s")
+  local e2, m2 = io.popen("touch %(marker)s")
+  local e3, m3 = package.loadlib("%(lib)s", "luaopen_os")
+  local ok, mod = pcall(require, "texdocxdrafter_planted")
+  texio.write_nl("EXEC:" .. tostring(e1) .. " POPEN:" .. tostring(e2) .. " LOADLIB:" .. tostring(e3) .. " REQUIRE:" .. tostring(ok))
+}
+x
+\end{document}
+"""
+
+
+@pytest.mark.skipif(not HAVE_LUALATEX, reason="lualatex not installed")
+def test_lua_guard_originals_cannot_be_recovered_and_native_code_cannot_load(tmp_path, monkeypatch):
+    """N30, N31: require("debug") gives the restricted table; os.execute, io.popen, loadlib and C modules are off."""
+    import glob
+
+    monkeypatch.setitem(sandbox._disabled, "bwrap", True)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched")
+    work = tmp_path / "work"
+    work.mkdir()
+    libs = glob.glob("/usr/lib/*/liblua5.*.so*") + glob.glob("/usr/lib/*/libm.so*")
+    lib = libs[0] if libs else "/nonexistent.so"
+    (work / "texdocxdrafter_planted.so").write_bytes(b"\x7fELF not really")
+    tex = work / "evil.tex"
+    tex.write_text(LUA_RECOVER % {"victim": str(victim), "marker": str(tmp_path / "ran.txt"), "lib": lib})
+    r = sandbox.compile_tex("lualatex", work, "evil", tex, [work], timeout=120, check_policy=False)
+    assert r.returncode != -1, r.stderr
+    log = (work / "evil.log").read_text(errors="replace").replace("\n", "")
+    assert "GETUPVALUE:nil:true" in log, log[-600:]
+    assert "EXEC:nil POPEN:nil LOADLIB:nil REQUIRE:false" in log, log[-600:]
+    assert victim.read_text() == "untouched" and not (tmp_path / "ran.txt").exists()
+
+
+def test_malformed_numbering_ids_in_template_do_not_crash(tmp_path):
+    """N32: a template with a non-numeric w:abstractNumId or w:numId still works as a reference document."""
+    import docx
+
+    tpl = tmp_path / "template.docx"
+    docx.Document().save(str(tpl))
+    with zipfile.ZipFile(tpl) as z:
+        numbering = z.read("word/numbering.xml")
+    first_child = numbering.index(b">", numbering.index(b"<w:numbering")) + 1
+    bad = (b'<w:abstractNum w:abstractNumId="abc"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/></w:lvl></w:abstractNum>'
+           b'<w:num w:numId="x1"><w:abstractNumId w:val="abc"/></w:num>')
+    _rezip(tpl, {"word/numbering.xml": [(numbering, numbering[:first_child] + bad + numbering[first_child:])]}, {})
+    src = _write(tmp_path, DOC.replace("Hello world.", "\\begin{itemize}\\item one\\end{itemize}"))
+    res = build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
+    assert res.check.ok, res.check.errors

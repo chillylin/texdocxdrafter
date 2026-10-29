@@ -298,7 +298,10 @@ capabilities, shell escape disabled, `openout_any=p`, a filtered environment and
 size (set through `prlimit` where util-linux provides it). Without
 bubblewrap no TeX engine is started; you compile the side documents yourself, exactly as you compile the paper.
 The report's run summary says which of the two happened. Image converters (poppler, Ghostscript) run under the
-same limits. Whatever a compile or a converter leaves in the work directory is treated as untrusted: the tool
+same limits. LuaTeX additionally loads a small guard that refuses file writes, links and directory changes
+outside the work directory, running programs, loading native code and recovering the unguarded functions
+through the `debug` library; the sandbox, not the guard, is the boundary. Whatever a compile or a converter
+leaves in the work directory is treated as untrusted: the tool
 reads only regular files there, never through a symbolic link, and creates its own files afresh.
 
 - Files are written only to the output `.docx`, its report, and `main.texdocxdrafter/` (the style map, the hash

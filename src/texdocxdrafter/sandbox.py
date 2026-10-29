@@ -266,7 +266,24 @@ if lfs_ok and lfs then
     end
   end
 end
-if debug then debug = { traceback = debug.traceback, getinfo = debug.getinfo } end
+-- no way to run programs or load native code (shell escape is off already; these make it explicit), and no
+-- recovery of the hooked originals: the restricted debug table is also what require("debug") returns, and the
+-- C-module searchers are gone so a planted .so cannot be loaded
+local function disabled() return nil, "texdocxdrafter: disabled" end
+os.execute, os.spawn, os.exec, io.popen = disabled, disabled, disabled, disabled
+package.loadlib = disabled
+package.cpath = ""
+if package.searchers then
+  for i = #package.searchers, 3, -1 do table.remove(package.searchers, i) end
+end
+if package.loaders then
+  for i = #package.loaders, 3, -1 do table.remove(package.loaders, i) end
+end
+if debug then
+  debug = { traceback = debug.traceback, getinfo = debug.getinfo }
+  package.loaded["debug"] = debug
+end
+package.preload["debug"] = nil
 """
 
 

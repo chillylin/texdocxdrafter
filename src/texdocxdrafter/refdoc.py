@@ -309,8 +309,17 @@ def _numbering(doc, user: bool) -> NumberingManager:
     if not user:
         return NumberingManager()
     root = doc.part.numbering_part.element
-    abs_ids = [int(a.get(qn("w:abstractNumId"))) for a in root.findall(qn("w:abstractNum"))]
-    num_ids = [int(a.get(qn("w:numId"))) for a in root.findall(qn("w:num"))]
+
+    def ids(tag: str, attr: str) -> list[int]:  # a malformed template may carry non-numeric ids: skip those
+        out = []
+        for a in root.findall(qn(tag)):
+            v = a.get(qn(attr), "")
+            if v.strip().lstrip("-").isdigit():
+                out.append(int(v))
+        return out
+
+    abs_ids = ids("w:abstractNum", "w:abstractNumId")
+    num_ids = ids("w:num", "w:numId")
     nm = NumberingManager(first_abs=max(abs_ids, default=-1) + 1, first_num=max(num_ids, default=0) + 1,
                           headings=False)
     nm.preserve = True
