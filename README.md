@@ -155,7 +155,7 @@ and citations and the reference list are read from that file.
 | `--comments` | Turn LaTeX `%` comments into Word comments (off by default, since source comments are often private) |
 | `--allow-dir DIR` | Also accept `\input`, `\include` and graphics from `DIR` (repeatable). By default only files under the directory of `main.tex` are read |
 | `--timeout SECONDS` | Limit for each TeX or biber run of the side compiles (default 120) |
-| `--validate-libreoffice` | Also try to open the result with headless LibreOffice, if installed |
+| `--validate-libreoffice` | Also try to open the result with headless LibreOffice, if installed. It runs in the same sandbox as the TeX engines with a private profile; a snap-packaged LibreOffice cannot start there and is reported as such |
 
 With `--no-harvest --no-tikz` the tool only parses; the same is true for BibTeX documents without TikZ.
 
@@ -293,8 +293,9 @@ How the tool decides:
 TikZ pictures need two side compiles of your own preamble (see "Side compiles"), and the tool runs them itself
 only inside bubblewrap: a sandbox in which the engine sees the system and TeX directories and the caches
 (read-only; of `/etc` only the font, TeX, loader and Ghostscript configuration, and no `/proc`), your document's
-directories (read-only) and a private work directory holding a throwaway `TEXMFVAR`, with no network, shell
-escape disabled, `openout_any=p`, a filtered environment and limits on time, CPU and output size. Without
+directories (read-only) and a private work directory holding a throwaway `TEXMFVAR`, with no network, no
+capabilities, shell escape disabled, `openout_any=p`, a filtered environment and limits on time, CPU and output
+size (set through `prlimit` where util-linux provides it). Without
 bubblewrap no TeX engine is started; you compile the side documents yourself, exactly as you compile the paper.
 The report's run summary says which of the two happened. Image converters (poppler, Ghostscript) run under the
 same limits. Whatever a compile or a converter leaves in the work directory is treated as untrusted: the tool
@@ -316,11 +317,13 @@ reads only regular files there, never through a symbolic link, and creates its o
 - A reference document is used for its styles, numbering, page setup, headers and footers only. Its comments
   and people list, footnotes and endnotes, glossary, custom XML, custom and extended properties, thumbnail,
   every core property, attached-template path and document variables are removed first, so nothing of the
-  template's own text or author travels into your draft. In its headers and footers only fields computed from
+  template's own text or author travels into your draft. Macro-enabled templates (`.docm`, `.dotm`) are
+  refused, and a VBA project inside a `.docx` is dropped. In its headers and footers only fields computed from
   the document itself survive (`PAGE`, `NUMPAGES`, dates, `STYLEREF`, `REF`, `SEQ` and the like); fields that
-  make Word fetch other files or URLs (`INCLUDETEXT`, `INCLUDEPICTURE`, `LINK`, `DDE`, …), alternate-format
-  chunks, sub-documents and externally linked pictures are removed, because the docx asks Word to update
-  all fields on opening so that its own cross-references show the right numbers.
+  make Word fetch other files or URLs (`INCLUDETEXT`, `INCLUDEPICTURE`, `LINK`, `DDE`, …) or show your file
+  path (`FILENAME`), alternate-format chunks, sub-documents, embedded objects and controls, and externally
+  linked pictures are removed, because the docx asks Word to update all fields on opening so that its own
+  cross-references show the right numbers.
 - Build files (`.aux`, `.bbl`, `.log`) that are symbolic links to files outside the project are refused, and
   the TikZ side compile receives only the `\newlabel` lines of the `.aux`, never the raw file.
 - Only `http`, `https` and `mailto` targets become Word hyperlinks; `\url` and `\href` with other schemes
@@ -329,7 +332,9 @@ reads only regular files there, never through a symbolic link, and creates its o
   you add directories with `--allow-dir`. A shared preamble in a parent directory therefore needs
   `--allow-dir ..`.
 - Source comments stay out of the docx unless you pass `--comments`.
-- The tool's own process runs under a memory cap (4 GiB of address space) and a CPU-time cap (30 minutes).
+- The tool's own process runs under a memory cap (4 GiB of address space) and a CPU-time cap (30 minutes),
+  also when `texdocxdrafter.pipeline.build` is called from Python; the report notes when a limit could not
+  be applied. Style names from the style map must be printable text and are escaped when written into XML.
   Author macro expansion has a budget (20,000 expansions, 2 million characters in total, 200,000 per
   expansion); a runaway definition such as `\newcommand{\dbl}{\dbl\dbl}` stops there with an error in the
   report and the remaining calls kept as text. A document that nests groups thousands of levels deep is

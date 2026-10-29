@@ -50,6 +50,19 @@ def _limits(cpu_seconds: int, max_bytes: int, max_memory: int | None):
 
 
 @functools.lru_cache(maxsize=1)
+def _prlimit() -> str | None:
+    """util-linux prlimit, which sets resource limits on itself and execs the command."""
+    exe = shutil.which("prlimit")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "--cpu=60", "--", "/bin/true"], capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return exe if r.returncode == 0 else None
+
+
+@functools.lru_cache(maxsize=1)
 def _bwrap() -> str | None:
     """Path of a working bubblewrap, or None (absent, or user namespaces not permitted)."""
     exe = shutil.which("bwrap")
@@ -151,7 +164,7 @@ def _wrap(cmd: list[str], rw: list[Path], ro: list[Path]) -> list[str]:
         d = Path(d)
         if d.exists():
             args += ["--bind", str(d), str(d)]
-    args += ["--unshare-all", "--die-with-parent", "--new-session", "--"]
+    args += ["--unshare-all", "--cap-drop", "ALL", "--die-with-parent", "--new-session", "--"]
     return args + cmd
 
 
@@ -171,7 +184,14 @@ def run(cmd: list[str], cwd: Path | str, env: dict | None = None, timeout: int =
             env.update(throwaway_texmfvar(Path(rw[0])))
     kw = dict(cwd=str(cwd), env=env, capture_output=True, text=True, errors="replace", timeout=timeout,
               stdin=subprocess.DEVNULL)
-    if os.name == "posix":
+    prlimit = _prlimit()
+    if prlimit:
+        # limits set by a wrapper that execs the command: no preexec_fn between fork and exec (unsafe with threads)
+        pre = [prlimit, f"--cpu={int(timeout)}:{int(timeout) + 5}", f"--fsize={max_bytes}"]
+        if max_memory:
+            pre.append(f"--as={max_memory}")
+        cmd = pre + ["--"] + cmd
+    elif os.name == "posix":
         kw["preexec_fn"] = _limits(int(timeout), max_bytes, max_memory)
     try:
         return subprocess.run(cmd, **kw)
@@ -313,19 +333,26 @@ def fresh_dir(path: Path | str) -> Path:
     return path
 
 
-def limit_self(max_memory: int = TOOL_MAX_MEMORY, cpu_seconds: int = TOOL_CPU_SECONDS) -> None:
-    """Resource limits for the tool's own process: a document must not take the machine down with it."""
+def limit_self(max_memory: int = TOOL_MAX_MEMORY, cpu_seconds: int = TOOL_CPU_SECONDS) -> list[str]:
+    """Resource limits for the tool's own process: a document must not take the machine down with it.
+
+    Returns the limits that could not be applied (empty when both are in force), for the caller to report."""
+    unmet: list[str] = []
     try:
         import resource
-
-        for res, limit in ((resource.RLIMIT_AS, max_memory), (resource.RLIMIT_CPU, cpu_seconds)):
+    except ImportError:
+        return ["memory (no resource module on this platform)", "CPU time (no resource module on this platform)"]
+    for res, limit, what in ((resource.RLIMIT_AS, max_memory, f"memory {max_memory // 1024 ** 3} GiB"),
+                             (resource.RLIMIT_CPU, cpu_seconds, f"CPU time {cpu_seconds} s")):
+        try:
             soft, hard = resource.getrlimit(res)
             if hard != resource.RLIM_INFINITY:
                 limit = min(limit, hard)
             if soft == resource.RLIM_INFINITY or soft > limit:
                 resource.setrlimit(res, (limit, hard))
-    except (ImportError, ValueError, OSError):
-        pass
+        except (ValueError, OSError) as exc:
+            unmet.append(f"{what} ({exc})")
+    return unmet
 
 
 def lua_guard(work: Path, allowed: list[Path]) -> Path:

@@ -313,6 +313,8 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
           timeout=sandbox.COMPILE_TIMEOUT, log=print) -> BuildResult:
     t0 = time.time()
     audit = Audit()
+    for what in sandbox.limit_self():  # also when build() is called as a library, not through the CLI
+        audit.add("other", f"could not limit the tool's own process: {what}", severity="info")
     pf = preflight(main, need_build_files=not no_harvest, allow_dirs=allow_dirs)
     config_dir = prepare_workdir(pf)
     sm_path = Path(style_map) if style_map else default_stylemap_path(pf)
@@ -411,9 +413,13 @@ def _libreoffice(out: Path, audit: Audit) -> None:
         return
     tmp = Path(tempfile.mkdtemp(prefix="texdocxdrafter-lo-"))
     try:
-        r = sandbox.run([exe, "--headless", "--convert-to", "pdf", "--outdir", str(tmp), str(out)], cwd=tmp, timeout=300)
+        # sandboxed like every other tool: it sees the docx (read-only) and a private profile and output directory
+        env = dict(os.environ, HOME=str(tmp))
+        r = sandbox.run([exe, f"-env:UserInstallation=file://{tmp}/profile", "--headless", "--convert-to", "pdf",
+                         "--outdir", str(tmp), str(out)], cwd=tmp, env=env, timeout=300, rw=[tmp], ro=[out.parent])
+        ok = r.returncode == 0 and (tmp / (out.stem + ".pdf")).is_file()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    ok = r.returncode == 0
-    audit.add("other", "LibreOffice opened and converted the file" if ok else f"LibreOffice failed: {r.stderr[:200]}",
+    audit.add("other", "LibreOffice opened and converted the file" if ok else
+              f"LibreOffice could not convert the file inside the sandbox: {(r.stderr or r.stdout)[:200]}",
               severity="info" if ok else "warn")

@@ -42,7 +42,7 @@ def bm_name(prefix: str, key: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_]", "_", key)
     name = f"{prefix}{safe}"
     if len(name) > 40:
-        name = name[:31] + hashlib.md5(key.encode()).hexdigest()[:9]
+        name = name[:31] + hashlib.sha256(key.encode()).hexdigest()[:9]
     return name
 
 

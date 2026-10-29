@@ -100,6 +100,8 @@ def validate(m: dict) -> dict:
             for k, v in user.items():
                 if not isinstance(v, str) or not v.strip():
                     raise StyleMapError(f"{sect}.{k} must be a non-empty style name")
+                if len(v) > 253 or any(not ch.isprintable() for ch in v):
+                    raise StyleMapError(f"{sect}.{k}: a style name must be printable text of at most 253 characters")
         out[sect].update(user)
     unknown_top = set(m) - set(DEFAULTS) - {"constructs"}
     if unknown_top:

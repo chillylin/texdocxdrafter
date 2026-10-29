@@ -1175,3 +1175,161 @@ def test_tool_process_has_memory_and_cpu_limits():
             "print(resource.getrlimit(resource.RLIMIT_AS)[0], resource.getrlimit(resource.RLIMIT_CPU)[0])")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.split()
     assert int(out[0]) <= sandbox.TOOL_MAX_MEMORY and int(out[1]) <= sandbox.TOOL_CPU_SECONDS
+
+
+# ---- sixth review round --------------------------------------------------------------------------
+
+def test_sandbox_drops_capabilities_and_limits_children_without_preexec(tmp_path):
+    import sys
+
+    if sandbox.have_os_sandbox():
+        args = sandbox._wrap(["true"], [tmp_path], [])
+        assert args[args.index("--cap-drop") + 1] == "ALL"
+    if not sandbox._prlimit():
+        pytest.skip("prlimit not available")
+    code = "import resource; print(resource.getrlimit(resource.RLIMIT_AS)[0], resource.getrlimit(resource.RLIMIT_CPU)[0])"
+    r = sandbox.run([sys.executable, "-c", code], cwd=tmp_path, timeout=30, max_memory=1 << 30)  # no bwrap: rw not given
+    assert r.stdout.split() == [str(1 << 30), "30"], r.stderr
+
+
+def _rezip(path: Path, replace: dict, add: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            for old, new in replace.get(item.filename, ()):
+                assert old in data, (item.filename, old)
+                data = data.replace(old, new)
+            zout.writestr(item, data)
+        for name, data in add.items():
+            zout.writestr(name, data)
+    tmp.replace(path)
+
+
+VBA_REL = b'<Relationship Id="rIdVba" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/>'
+VBA_CT = b'<Override PartName="/word/vbaProject.bin" ContentType="application/vnd.ms-office.vbaProject"/>'
+
+
+def test_macro_enabled_template_is_refused(tmp_path):
+    """N8 residual: a .docm/.dotm template is refused outright rather than silently carrying its VBA."""
+    import docx
+
+    from texdocxdrafter.refdoc import TemplateError
+
+    tpl = tmp_path / "template.docm"
+    docx.Document().save(str(tpl))
+    _rezip(tpl, {
+        "[Content_Types].xml": [(b"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                                 b"application/vnd.ms-word.document.macroEnabled.main+xml"), (b"</Types>", VBA_CT + b"</Types>")],
+        "word/_rels/document.xml.rels": [(b"</Relationships>", VBA_REL + b"</Relationships>")],
+    }, {"word/vbaProject.bin": b"VBA-SECRET"})
+    src = _write(tmp_path)
+    with pytest.raises(TemplateError, match="macro-enabled"):
+        build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
+    assert not (tmp_path / "main.docx").exists()
+
+
+def test_vba_and_embedded_objects_in_template_are_stripped(tmp_path):
+    """N8 residual: a VBA project smuggled into a .docx and an OLE object in the header do not travel."""
+    import docx
+    from docx.oxml import parse_xml
+
+    tpl = tmp_path / "template.docx"
+    d = docx.Document()
+    p = d.sections[0].header.paragraphs[0]
+    p.text = "Running head "
+    W = ('xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+         'xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:v="urn:schemas-microsoft-com:vml"')
+    p._p.append(parse_xml(f'<w:r {W}><w:object><v:shape id="s1" style="width:10pt;height:10pt"/>'
+                          '<o:OLEObject Type="Embed" ProgID="Package" ShapeID="s1" DrawAspect="Icon" ObjectID="_1" r:id="rIdOle"/>'
+                          '</w:object></w:r>'))
+    d.save(str(tpl))
+    with zipfile.ZipFile(tpl) as z:
+        header = [n for n in z.namelist() if n.startswith("word/header") and n.endswith(".xml")][0]
+        header_rels = "word/_rels/" + header.split("/")[-1] + ".rels"
+        has_rels = header_rels in z.namelist()
+    ole_rel = (b'<Relationship Id="rIdOle" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" '
+               b'Target="embeddings/oleObject1.bin"/>')
+    add = {"word/vbaProject.bin": b"VBA-SECRET", "word/embeddings/oleObject1.bin": b"OLE-SECRET"}
+    replace = {
+        "[Content_Types].xml": [(b"</Types>", VBA_CT + b'<Default Extension="bin" ContentType="application/vnd.openxmlformats-officedocument.oleObject"/></Types>')],
+        "word/_rels/document.xml.rels": [(b"</Relationships>", VBA_REL + b"</Relationships>")],
+    }
+    if has_rels:
+        replace[header_rels] = [(b"</Relationships>", ole_rel + b"</Relationships>")]
+    else:
+        add[header_rels] = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships '
+                            b'xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + ole_rel + b"</Relationships>")
+    _rezip(tpl, replace, add)
+    src = _write(tmp_path)
+    res = build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    z = zipfile.ZipFile(tmp_path / "main.docx")
+    blob = b"".join(z.read(n) for n in z.namelist())
+    assert b"VBA-SECRET" not in blob and b"OLE-SECRET" not in blob and b"vbaProject" not in blob
+    headers = "".join(z.read(n).decode() for n in z.namelist() if n.startswith("word/header"))
+    assert "Running head" in headers and "w:object" not in headers and "OLEObject" not in headers
+
+
+def test_style_names_are_escaped_and_validated(tmp_path):
+    """N11: a style name with quotes, ampersand and angle brackets is escaped; control characters are refused."""
+    import docx
+
+    from texdocxdrafter.stylemap import StyleMapError, validate
+
+    name = 'Body "Text" & <Co>'
+    sm = tmp_path / "map.yaml"
+    sm.write_text(f"paragraph:\n  body: '{name}'\n")
+    src = _write(tmp_path)
+    res = build(src, style_map=sm, no_harvest=True, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    from docx.oxml.ns import qn
+
+    styles = docx.Document(str(tmp_path / "main.docx")).styles.element  # styles[name] itself cannot quote such a name
+    assert any(st.find(qn("w:name")).get(qn("w:val")) == name for st in styles.findall(qn("w:style")))
+    with pytest.raises(StyleMapError, match="printable"):
+        validate({"paragraph": {"body": "Body\x00Text"}})
+    with pytest.raises(StyleMapError, match="printable"):
+        validate({"character": {"emph": "x" * 300}})
+
+
+def test_libreoffice_validation_runs_sandboxed(tmp_path, monkeypatch):
+    """N12: the validation run gets the same sandbox as every other tool, with a private profile."""
+    import subprocess
+
+    from texdocxdrafter import pipeline as pl
+
+    seen = {}
+
+    def run(cmd, cwd, env=None, timeout=0, rw=None, ro=None, **k):
+        seen.update(cmd=cmd, env=env, rw=rw, ro=ro)
+        return subprocess.CompletedProcess(cmd, 1, "", "no office here")
+
+    monkeypatch.setattr(pl.shutil, "which", lambda name: "/opt/fake/soffice" if name == "soffice" else None)
+    monkeypatch.setattr(sandbox, "run", run)
+    src = _write(tmp_path)
+    res = build(src, no_harvest=True, validate_lo=True, log=lambda *_: None)
+    assert seen["rw"] and seen["ro"] == [tmp_path] and seen["env"]["HOME"] == str(seen["rw"][0])
+    assert any(a.startswith("-env:UserInstallation=file://") for a in seen["cmd"])
+    assert any("inside the sandbox" in e.message for e in res.audit.entries)
+
+
+def test_bookmark_names_use_sha256():
+    import hashlib
+
+    from texdocxdrafter.writer import bm_name
+
+    key = "a-very-long-citation-key-" * 4
+    name = bm_name("cite_", key)
+    assert len(name) == 40 and name.endswith(hashlib.sha256(key.encode()).hexdigest()[:9])
+
+
+def test_build_limits_its_own_process_and_reports_when_it_cannot(tmp_path, monkeypatch):
+    """N10 residual: build() applies the limits itself, so a library caller gets them too."""
+    calls = []
+    monkeypatch.setattr(sandbox, "limit_self", lambda *a, **k: calls.append(1) or ["memory 4 GiB (test)"])
+    src = _write(tmp_path)
+    res = build(src, no_harvest=True, log=lambda *_: None)
+    assert calls and any("could not limit the tool's own process: memory 4 GiB (test)" in e.message for e in res.audit.entries)
+    assert sandbox.limit_self.__name__ == "<lambda>"  # the real one is exercised by test_tool_process_has_memory_and_cpu_limits

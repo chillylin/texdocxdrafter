@@ -22,13 +22,15 @@ def _preflight(args, need_build_files=True):
 def cmd_build(args) -> int:
     from .pipeline import build
     from .preflight import PreflightError
+    from .refdoc import TemplateError
+    from .stylemap import StyleMapError
 
     try:
         res = build(args.main, out=args.output, style_map=args.style_map, reference_doc=args.reference_doc,
                     link_citations=args.link_citations, keep_work=args.keep_work, no_harvest=args.no_harvest,
                     no_tikz=args.no_tikz, validate_lo=args.validate_libreoffice, comments=args.comments,
                     overwrite=args.overwrite, allow_dirs=args.allow_dir or (), timeout=args.timeout)
-    except PreflightError as exc:
+    except (PreflightError, TemplateError, StyleMapError) as exc:
         print(f"texdocxdrafter: {exc}", file=sys.stderr)
         return 2
     warn = len(res.audit.warnings())

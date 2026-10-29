@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from docx import Document
 from docx.oxml import parse_xml
@@ -18,6 +19,15 @@ from .writer.numbering import NumberingManager
 from .writer.xmlutil import style_id
 
 NS = nsdecls("w")
+
+
+def _attr(value: str) -> str:
+    """A style name (from the style map or a template) as an XML attribute value."""
+    return escape(value, {'"': "&quot;"})
+
+
+class TemplateError(ValueError):
+    """The reference document cannot be used as a template."""
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 # name -> (type, basedOn, next, pPr xml, rPr xml). Sizes are half-points, spacing/indent twips.
@@ -72,7 +82,7 @@ def _find(doc, name: str):
 
 def _make(doc, name: str, kind: str, based: str | None, nxt: str | None, ppr: str, rpr: str) -> None:
     sid = style_id(name)
-    parts = [f'<w:style {NS} w:type="{kind}" w:customStyle="1" w:styleId="{sid}">', f'<w:name w:val="{name}"/>']
+    parts = [f'<w:style {NS} w:type="{kind}" w:customStyle="1" w:styleId="{sid}">', f'<w:name w:val="{_attr(name)}"/>']
     if based:
         parts.append(f'<w:basedOn w:val="{style_id(based)}"/>')
     if nxt:
@@ -109,7 +119,11 @@ def _strip_num(style_el) -> None:
 def build_reference(sm: dict, template: str | Path | None = None, audit: Audit | None = None):
     """Return (Document with empty body, NumberingManager, info dict)."""
     user = template is not None
-    doc = Document(str(template)) if user else Document()
+    try:
+        doc = Document(str(template)) if user else Document()
+    except ValueError as exc:  # python-docx: not a plain Word document (a .docm/.dotm, or not a docx at all)
+        raise TemplateError(f"the reference document cannot be used: {exc}; macro-enabled (.docm/.dotm) templates "
+                            "are not accepted, save it as .docx or .dotx first") from exc
     body = doc.element.body
     for child in list(body):
         if child.tag != qn("w:sectPr"):
@@ -162,7 +176,9 @@ def build_reference(sm: dict, template: str | Path | None = None, audit: Audit |
 
 # parts of a user template that carry its content or its author's data rather than its styles
 _DOC_RELS = ("/comments", "/commentsExtended", "/commentsIds", "/commentsExtensible", "/people",
-             "/footnotes", "/endnotes", "/glossaryDocument", "/customXml")
+             "/footnotes", "/endnotes", "/glossaryDocument", "/customXml", "/vbaProject", "/vbaData")
+# in a header or footer: embedded objects and controls, and the parts they are bound to
+_STORY_RELS = ("/oleObject", "/package", "/control", "/aFChunk", "/subDocument", "/vbaProject")
 _PKG_RELS = ("/custom-properties", "/thumbnail")
 _COMMENT_MARKS = ("w:commentRangeStart", "w:commentRangeEnd", "w:commentReference", "w:footnoteReference",
                   "w:endnoteReference")
@@ -180,6 +196,8 @@ def _scrub_template(doc) -> None:
     the glossary, custom XML, custom and extended properties, the thumbnail of its first page, every core
     property, the attached-template path and document variables in settings."""
     part = doc.part
+    if "macroEnabled" in (part.content_type or ""):  # python-docx refuses these already; belt and braces
+        raise TemplateError("the reference document is macro-enabled (.docm/.dotm); save it as .docx or .dotx first")
     for rid, rel in list(part.rels.items()):
         if rel.reltype.endswith(_DOC_RELS):
             del part.rels[rid]
@@ -221,7 +239,7 @@ def _scrub_template(doc) -> None:
 # make Word fetch local or remote content when the fields are updated, and the writer asks for exactly
 # that (updateFields) so that its own REF and SEQ fields show the right numbers.
 _SAFE_FIELDS = frozenset("""PAGE NUMPAGES SECTIONPAGES SECTION DATE TIME CREATEDATE SAVEDATE PRINTDATE EDITTIME
-TITLE AUTHOR SUBJECT KEYWORDS COMMENTS FILENAME TEMPLATE REVNUM NUMWORDS NUMCHARS STYLEREF SEQ REF PAGEREF NOTEREF
+TITLE AUTHOR SUBJECT KEYWORDS COMMENTS REVNUM NUMWORDS NUMCHARS STYLEREF SEQ REF PAGEREF NOTEREF
 TOC INDEX XE TC SYMBOL HYPERLINK QUOTE IF COMPARE SET FORMULA = LISTNUM AUTONUM AUTONUMLGL AUTONUMOUT
 ADVANCE EQ MERGEFIELD""".split())
 
@@ -252,15 +270,16 @@ def _scrub_story(part) -> None:
                 doomed.extend(runs)
     for runs, pieces in open_fields:  # unterminated field: nothing to trust
         doomed.extend(runs)
-    for tag in ("w:altChunk", "w:subDoc", "w:contentPart"):
+    for tag in ("w:altChunk", "w:subDoc", "w:contentPart", "w:object", "w:control"):
         doomed.extend(root.iter(qn(tag)))
-    external = {rid for rid, rel in part.rels.items() if rel.is_external and not rel.reltype.endswith("/hyperlink")}
-    if external:
+    gone = {rid for rid, rel in part.rels.items()
+            if (rel.is_external and not rel.reltype.endswith("/hyperlink")) or rel.reltype.endswith(_STORY_RELS)}
+    if gone:
         for e in root.iter():
-            if any(v in external for k, v in e.attrib.items() if k.startswith("{%s}" % _R_NS)):
+            if any(v in gone for k, v in e.attrib.items() if k.startswith("{%s}" % _R_NS)):
                 run = next((a for a in e.iterancestors() if a.tag == qn("w:r")), None)
                 doomed.append(run if run is not None else e)
-        for rid in external:
+        for rid in gone:
             del part.rels[rid]
     for e in doomed:
         parent = e.getparent()
@@ -327,7 +346,7 @@ def _make_table_style(doc, name: str, rules: bool) -> None:
                  '<w:rPr><w:b/></w:rPr></w:tblStylePr>')
     else:
         borders, first = "", ""
-    xml = (f'<w:style {NS} w:type="table" w:customStyle="1" w:styleId="{sid}"><w:name w:val="{name}"/>'
+    xml = (f'<w:style {NS} w:type="table" w:customStyle="1" w:styleId="{sid}"><w:name w:val="{_attr(name)}"/>'
            f'<w:basedOn w:val="TableNormal"/><w:uiPriority w:val="59"/><w:qFormat/>'
            f'<w:tblPr><w:tblInd w:w="0" w:type="dxa"/>{borders}'
            f'<w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="108" w:type="dxa"/>'
