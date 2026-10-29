@@ -1,9 +1,9 @@
 """Run external tools (TeX engines, biber, poppler, ghostscript) with limits.
 
 Every subprocess gets a wall-clock timeout, a CPU-time limit and a cap on the size of files it may
-write. Where bubblewrap (``bwrap``) is available, tools run in a mount namespace in which the whole
-file system is read-only except the run's work directory and TeX's own cache directories, with no
-network. TeX engines additionally run with shell escape disabled and ``openout_any=p``; LuaTeX, whose
+write, and a filtered environment. Where bubblewrap (``bwrap``) is available, tools run in a mount
+namespace that contains only the system and TeX directories (read-only), the document's input
+directories (read-only) and the run's work directory plus TeX's caches (writable), with no network. TeX engines additionally run with shell escape disabled and ``openout_any=p``; LuaTeX, whose
 Lua ``io`` library ignores ``openout_any``, also loads a small init script that refuses file writes
 outside the allowed directories, so documents stay contained even without bubblewrap.
 """
@@ -74,11 +74,50 @@ def cache_dirs() -> tuple[Path, ...]:
     return tuple(out)
 
 
-def _wrap(cmd: list[str], rw: list[Path]) -> list[str]:
+SYSTEM_RO = ("/usr", "/lib", "/lib32", "/lib64", "/bin", "/sbin", "/etc", "/opt", "/var/lib/texmf",
+             "/var/lib/ghostscript", "/var/cache/fontconfig", "/run/current-system")
+ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TERM", "TZ", "SOURCE_DATE_EPOCH")
+ENV_PREFIXES = ("LC_", "TEXMF", "KPATHSEA", "FONTCONFIG", "OSFONTDIR", "TEXINPUTS", "BIBINPUTS", "BSTINPUTS",
+                "openout_any", "shell_escape", "TMPDIR", "TEMP", "TMP", "XDG_CACHE_HOME", "XDG_CONFIG_HOME")
+
+
+@functools.lru_cache(maxsize=1)
+def tex_dirs() -> tuple[Path, ...]:
+    """TeX trees and user font directories a compile may need to read."""
+    out: list[Path] = []
+    for var in ("TEXMFROOT", "TEXMFDIST", "TEXMFLOCAL", "TEXMFSYSVAR", "TEXMFSYSCONFIG", "TEXMFHOME", "TEXMFCONFIG"):
+        try:
+            r = subprocess.run(["kpsewhich", "-var-value", var], capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        for item in r.stdout.strip().split(":"):
+            if item and Path(item).is_dir():
+                out.append(Path(item))
+    home = Path.home()
+    for d in (home / ".fonts", home / ".local" / "share" / "fonts", home / ".config" / "fontconfig"):
+        if d.is_dir():
+            out.append(d)
+    return tuple(out)
+
+
+def filtered_env(env: dict | None) -> dict:
+    """Only the variables a TeX or converter run needs; nothing else from the caller's environment leaks in."""
+    src = env if env is not None else os.environ
+    return {k: v for k, v in src.items() if k in ENV_KEEP or k.startswith(ENV_PREFIXES)}
+
+
+def _wrap(cmd: list[str], rw: list[Path], ro: list[Path]) -> list[str]:
+    """bubblewrap: system and TeX directories read-only, the inputs read-only, ``rw`` writable, nothing else visible."""
     exe = _bwrap() if not _disabled["bwrap"] else None
     if not exe:
         return cmd
-    args = [exe, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]
+    args = [exe, "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp"]
+    for d in SYSTEM_RO:
+        if Path(d).is_dir():
+            args += ["--ro-bind", d, d]
+    for d in list(tex_dirs()) + [Path(x) for x in ro]:
+        if d.exists():
+            args += ["--ro-bind", str(d), str(d)]
     for d in rw:
         d = Path(d)
         if d.exists():
@@ -89,15 +128,15 @@ def _wrap(cmd: list[str], rw: list[Path]) -> list[str]:
 
 def run(cmd: list[str], cwd: Path | str, env: dict | None = None, timeout: int = TOOL_TIMEOUT,
         max_bytes: int = MAX_FILE_BYTES, max_memory: int | None = None,
-        rw: list[Path] | None = None) -> subprocess.CompletedProcess:
+        rw: list[Path] | None = None, ro: list[Path] | None = None) -> subprocess.CompletedProcess:
     """subprocess.run with a timeout and resource limits. A timeout yields returncode -1, never an exception.
 
-    With ``rw`` given, the command runs in the OS sandbox (when available) and may write only there."""
+    With ``rw`` given the command is sandboxed (when bubblewrap is available): it sees the system and TeX
+    directories, the ``ro`` inputs and the ``rw`` directories, and may write only to the latter."""
+    env = filtered_env(env)
     if rw is not None:
-        cmd = _wrap(cmd, list(rw) + list(cache_dirs()))
-        if rw and have_os_sandbox():
-            # the rest of the file system is read-only; give the tool a writable temp inside its own directory
-            env = dict(env or os.environ)
+        cmd = _wrap(cmd, list(rw) + list(cache_dirs()), list(ro or []))
+        if rw:
             for var in ("TMPDIR", "TEMP", "TMP"):
                 env[var] = str(rw[0])
     kw = dict(cwd=str(cwd), env=env, capture_output=True, text=True, errors="replace", timeout=timeout,
@@ -107,7 +146,10 @@ def run(cmd: list[str], cwd: Path | str, env: dict | None = None, timeout: int =
     try:
         return subprocess.run(cmd, **kw)
     except subprocess.TimeoutExpired as exc:
-        return subprocess.CompletedProcess(cmd, -1, exc.stdout or "", f"timed out after {timeout} s")
+        partial = exc.stdout or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", "replace")
+        return subprocess.CompletedProcess(cmd, -1, partial, f"timed out after {timeout} s")
     except OSError as exc:
         return subprocess.CompletedProcess(cmd, -1, "", str(exc))
 
@@ -127,8 +169,8 @@ LUA_GUARD = r"""
 -- texdocxdrafter: refuse Lua file writes outside the allowed directories (openout_any does not cover io.open)
 local allowed = { @@ALLOWED@@ }
 local lfs_ok, lfs = pcall(require, "lfs")
-local cwd = (lfs_ok and lfs.currentdir()) or "."
 local function absolute(p)
+  local cwd = (lfs_ok and lfs.currentdir()) or "."
   if p:sub(1, 1) ~= "/" then p = cwd .. "/" .. p end
   p = p:gsub("/%./", "/"):gsub("/+", "/")
   while true do
@@ -160,9 +202,16 @@ local os_remove, os_rename = os.remove, os.rename
 os.remove = function(name) if not permitted(name) then return nil, refuse end return os_remove(name) end
 os.rename = function(a, b) if not (permitted(a) and permitted(b)) then return nil, refuse end return os_rename(a, b) end
 if lfs_ok and lfs then
-  for _, fn in ipairs({ "mkdir", "rmdir", "touch", "link" }) do
+  for _, fn in ipairs({ "mkdir", "rmdir", "touch" }) do
     local orig = lfs[fn]
     if orig then lfs[fn] = function(name, ...) if not permitted(name) then return nil, refuse end return orig(name, ...) end end
+  end
+  local lfs_link = lfs.link
+  if lfs_link then
+    lfs.link = function(old, new, ...)
+      if not (permitted(old) and permitted(new)) then return nil, refuse end
+      return lfs_link(old, new, ...)
+    end
   end
 end
 if debug then debug = { traceback = debug.traceback, getinfo = debug.getinfo } end
@@ -189,4 +238,19 @@ def tex_cmd(engine: str, work: Path, jobname: str, texfile: Path) -> list[str]:
 def compile_tex(engine: str, work: Path, jobname: str, texfile: Path, dirs: list[Path],
                 timeout: int = COMPILE_TIMEOUT) -> subprocess.CompletedProcess:
     """One engine run inside ``work``; the document may read from ``dirs`` and write only into ``work``."""
-    return run(tex_cmd(engine, work, jobname, texfile), cwd=work, env=tex_env(dirs), timeout=timeout, rw=[work])
+    return run(tex_cmd(engine, work, jobname, texfile), cwd=work, env=tex_env(dirs), timeout=timeout, rw=[work], ro=dirs)
+
+
+def is_luatex(engine: str) -> bool:
+    return "lua" in Path(engine).name
+
+
+def side_compiles_allowed(engine: str, trust: bool) -> str | None:
+    """None when side compiles may run; otherwise the reason they are skipped.
+
+    LuaTeX documents run Lua code, and the Lua write guard is defence in depth only, so without an
+    OS sandbox they are compiled only when the user vouches for the document with --trust."""
+    if is_luatex(engine) and not have_os_sandbox() and not trust:
+        return ("LuaTeX documents are compiled only inside an OS sandbox (install bubblewrap) or with --trust; "
+                "side compiles skipped")
+    return None

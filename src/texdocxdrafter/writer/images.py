@@ -34,7 +34,7 @@ def safe_dpi(pdf: Path, dpi: int = 300, max_px: int = MAX_PIXELS) -> int:
     """Resolution that keeps every page of ``pdf`` within ``max_px`` on its longest side."""
     if not shutil.which("pdfinfo"):
         return dpi
-    r = sandbox.run(["pdfinfo", "-f", "1", "-l", "200", str(pdf)], cwd=pdf.parent, timeout=30, rw=[])
+    r = sandbox.run(["pdfinfo", "-f", "1", "-l", "200", str(pdf)], cwd=pdf.parent, timeout=30, rw=[], ro=[pdf.parent])
     dims = [float(x) for pair in re.findall(r"size:\s+([0-9.]+) x ([0-9.]+)", r.stdout) for x in pair]
     if not dims:
         return dpi
@@ -62,7 +62,7 @@ def to_raster(path: Path, workdir: Path) -> Path | None:
     workdir.mkdir(parents=True, exist_ok=True)
     key = _cache_key(path, "png,300,first-page")
     out_base = workdir / f"{path.stem}-{key}"
-    out = out_base.with_suffix(".png")
+    out = Path(str(out_base) + ".png")  # not with_suffix: a stem such as figure.v1 keeps its dots
     if out.exists():
         return out
     src = path
@@ -72,7 +72,7 @@ def to_raster(path: Path, workdir: Path) -> Path | None:
         tmp = workdir / f"{path.stem}-{key}-eps.pdf"
         r = sandbox.run(["gs", "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-dEPSCrop", "-sDEVICE=pdfwrite",
                          f"-sOutputFile={tmp}", str(path)], cwd=workdir, timeout=sandbox.TOOL_TIMEOUT,
-                        max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[workdir])
+                        max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[workdir], ro=[path.parent])
         if r.returncode != 0 or not tmp.exists():
             return None
         src = tmp
@@ -83,7 +83,7 @@ def to_raster(path: Path, workdir: Path) -> Path | None:
         dpi = safe_dpi(src, 300)
         r = sandbox.run(["pdftoppm", "-r", str(dpi), "-png", "-singlefile", "-f", "1", "-l", "1", str(src),
                          str(out_base)], cwd=workdir, timeout=sandbox.TOOL_TIMEOUT,
-                        max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[workdir])
+                        max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[workdir], ro=[src.parent])
         return out if r.returncode == 0 and out.exists() else None
     return None
 

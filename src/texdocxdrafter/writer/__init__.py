@@ -1010,7 +1010,7 @@ class DocxWriter:
             sec.page_width, sec.page_height = Inches(8.5), Inches(11)
         sec.left_margin = sec.right_margin = sec.top_margin = sec.bottom_margin = Inches(1)
 
-    def write(self, out: str | Path, comments: bool = True) -> Path:
+    def write(self, out, comments: bool = True):
         self.page_setup()
         anchors = []  # (block loc, first paragraph written for the block)
         for k, b in enumerate(self.doc.blocks):
@@ -1044,8 +1044,8 @@ class DocxWriter:
         if self.doc.authors:
             cp.author = "; ".join("".join(_inline_text(a)) for a in self.doc.authors)
         cp.last_modified_by = "texdocxdrafter"  # lets a later run tell its own untouched output from an edited draft
-        out = Path(out)
-        self.d.save(str(out))
+        # a file object (the pipeline writes the bytes itself, atomically) or a path
+        self.d.save(out if hasattr(out, "write") else str(out))
         self.audit.info["styles used"] = len(self.used)
         return out
 

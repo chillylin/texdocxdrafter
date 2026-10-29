@@ -92,8 +92,9 @@ texdocxdrafter build main.tex
 This writes `main.docx` and `main.texdocxdrafter-report.md` next to `main.tex`. Open the report first: it lists
 what needs manual attention.
 
-If `main.docx` already exists and was not written by `texdocxdrafter` (or has been saved since, for example by
-a coauthor in Word), the build stops rather than overwrite it. Pass `-o other.docx` or `--overwrite`.
+If `main.docx` already exists and is not byte-for-byte a file this tool wrote (for example because a coauthor
+has saved it), the build stops rather than overwrite it. Pass `-o other.docx` or `--overwrite`. The same
+protection covers the report.
 
 In Word, press `Ctrl+A` then `F9` to refresh all fields (`texdocxdrafter` also sets "update fields on open", so
 Word may ask whether to update them). After that, inserting or moving a section renumbers headings,
@@ -124,6 +125,7 @@ captions, equations and every cross-reference.
 | `--comments` | Turn LaTeX `%` comments into Word comments (off by default, since source comments are often private) |
 | `--allow-dir DIR` | Also accept `\input`, `\include` and graphics from `DIR` (repeatable). By default only files under the directory of `main.tex` are read |
 | `--timeout SECONDS` | Limit for each TeX or biber run of the side compiles (default 120) |
+| `--trust` | Run the side compiles of a LuaTeX document even when no OS sandbox (bubblewrap) is available |
 | `--validate-libreoffice` | Also try to open the result with headless LibreOffice, if installed |
 
 With `--no-harvest --no-tikz` no TeX engine is run at all.
@@ -258,19 +260,25 @@ How the tool decides:
 
 `texdocxdrafter` compiles parts of your document twice more (the citation harvest and the TikZ pictures)
 with your own TeX engine, because that is the only way to get biblatex's exact rendering. Those side
-compiles, and the image converters, run in a private temporary directory with shell escape disabled and
-`openout_any=p`; where bubblewrap is installed they also run in a sandbox in which the whole file system
-is read-only except that directory and TeX's font caches, with no network. LuaTeX, whose Lua `io` library
-ignores `openout_any`, additionally loads a guard that refuses file writes elsewhere. Every run is limited
-in time, CPU and output size, and the report's run summary says which sandbox was in effect. Even so, a
-TeX document is a program: convert documents you trust, or use `--no-harvest --no-tikz`.
+compiles, and the image converters, run in a private temporary directory with shell escape disabled,
+`openout_any=p` and a filtered environment. Where bubblewrap is installed they also run in a sandbox that
+contains only the system and TeX directories (read-only), the document's own directories (read-only) and
+the work directory plus TeX's font caches (writable), with no network: a document cannot read or write
+anything else. Without bubblewrap, pdfTeX and XeTeX are still kept from writing outside the work
+directory by TeX itself, but LuaTeX runs Lua code whose `io` library ignores `openout_any`; a guard script
+refuses such writes, yet it is defence in depth only, so LuaTeX documents are compiled only inside
+bubblewrap or with `--trust`. Every run is limited in time, CPU and output size, and the report's run
+summary says which sandbox was in effect. Even so, a TeX document is a program: convert documents you
+trust, or use `--no-harvest --no-tikz`.
 
 - Files are written only to the output `.docx`, its report, and `main.texdocxdrafter/` (the style map and,
   with `--keep-work`, a `work/` directory that is replaced on the next run only if this tool created it).
   Nothing else next to your sources is created, changed or deleted. The docx is written to a temporary name
   and renamed into place, so an interrupted run never leaves a half-written file.
-- The output is never a source file, and an existing `.docx` not written by this tool is not overwritten
-  without `--overwrite`.
+- The output and the report are never source files or symbolic links. The tool records a hash of every file
+  it writes in `main.texdocxdrafter/outputs.json`; an existing file whose hash does not match, that is, any
+  file it did not write or that has been changed since, is not overwritten without `--overwrite`. Files are
+  written through an exclusively created temporary file and renamed into place.
 - `\input`, `\include` and graphics are read only from the directory of `main.tex`, symlinks resolved, unless
   you add directories with `--allow-dir`. A shared preamble in a parent directory therefore needs
   `--allow-dir ..`.

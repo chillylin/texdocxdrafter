@@ -29,12 +29,24 @@ def _groups(s: str) -> list[str]:
     return out
 
 
-def read_aux(path: Path | None, _seen: set | None = None) -> dict[str, AuxLabel]:
+MAX_DEPTH = 10
+
+
+def read_aux(path: Path | None, roots: list[Path] | None = None, _seen: set | None = None,
+             _depth: int = 0) -> dict[str, AuxLabel]:
+    """Labels of an .aux file and the .aux files it ``\\@input``s, which must lie under ``roots`` (if given)."""
+    from .preflight import inside
+
     labels: dict[str, AuxLabel] = {}
-    if path is None or not Path(path).is_file():
+    if path is None or _depth > MAX_DEPTH:
+        return labels
+    try:
+        path = Path(path).resolve(strict=True)
+    except OSError:
+        return labels
+    if not path.is_file() or (roots and not inside(path, roots)):
         return labels
     seen = _seen if _seen is not None else set()
-    path = Path(path)
     if path in seen:
         return labels
     seen.add(path)
@@ -62,7 +74,7 @@ def read_aux(path: Path | None, _seen: set | None = None) -> dict[str, AuxLabel]
         im = re.match(r"\\@input\{([^}]*)\}", line)
         if im:
             sub = path.parent / im.group(1)
-            for k, v in read_aux(sub, seen).items():
+            for k, v in read_aux(sub, roots, seen, _depth + 1).items():
                 labels.setdefault(k, v)
     return labels
 

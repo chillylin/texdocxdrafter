@@ -27,7 +27,8 @@ def cmd_build(args) -> int:
         res = build(args.main, out=args.output, style_map=args.style_map, reference_doc=args.reference_doc,
                     link_citations=args.link_citations, keep_work=args.keep_work, no_harvest=args.no_harvest,
                     no_tikz=args.no_tikz, validate_lo=args.validate_libreoffice, comments=args.comments,
-                    overwrite=args.overwrite, allow_dirs=args.allow_dir or (), timeout=args.timeout)
+                    overwrite=args.overwrite, allow_dirs=args.allow_dir or (), timeout=args.timeout,
+                    trust=args.trust)
     except PreflightError as exc:
         print(f"texdocxdrafter: {exc}", file=sys.stderr)
         return 2
@@ -147,6 +148,8 @@ def main(argv=None) -> int:
     b.add_argument("--allow-dir", action="append", metavar="DIR",
                    help="additional directory that \\input and graphics may come from (repeatable)")
     b.add_argument("--timeout", type=int, default=120, metavar="SECONDS", help="limit per TeX/biber run (default 120)")
+    b.add_argument("--trust", action="store_true",
+                   help="run the side compiles of a LuaTeX document even without an OS sandbox (bubblewrap)")
     b.add_argument("--validate-libreoffice", action="store_true")
     b.set_defaults(fn=cmd_build)
 

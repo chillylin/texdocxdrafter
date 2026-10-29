@@ -148,12 +148,12 @@ def compile_harvest(pf: Preflight, tex: str, audit: Audit, timeout: int = sandbo
         audit.add("harvest", f"harvest compile aborted ({engine}): {r.stderr}")
         return None
     if pf.uses_biblatex and shutil.which("biber"):
-        sandbox.run(["biber", "--output-directory", str(work), "harvest"], cwd=work, env=env, timeout=timeout, rw=[work])
+        sandbox.run(["biber", "--output-directory", str(work), "harvest"], cwd=work, env=env, timeout=timeout, rw=[work], ro=dirs)
         tex_run()
         tex_run()
     elif not pf.uses_biblatex and shutil.which("bibtex"):
         # bibtex looks for the .aux in its working directory and for .bib/.bst files on BIBINPUTS/BSTINPUTS
-        b = sandbox.run(["bibtex", "harvest"], cwd=work, env=env, timeout=timeout, rw=[work])
+        b = sandbox.run(["bibtex", "harvest"], cwd=work, env=env, timeout=timeout, rw=[work], ro=dirs)
         for m in re.findall(r"I couldn't open (?:database|style) file (\S+)", b.stdout):
             audit.add("harvest", f"bibtex could not open {m}")
         tex_run()
@@ -312,7 +312,11 @@ def run_harvest(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandb
     if not shutil.which("pdftotext"):
         audit.add("harvest", "pdftotext not found; citations rendered as [key]")
         return res
-    txt = sandbox.run(["pdftotext", "-raw", str(pdf), "-"], cwd=pf.workdir, timeout=60, rw=[]).stdout
+    r = sandbox.run(["pdftotext", "-raw", str(pdf), "-"], cwd=pf.workdir, timeout=60, rw=[], ro=[pf.workdir])
+    if r.returncode != 0:
+        audit.add("harvest", f"pdftotext failed: {r.stderr[:200]}; citations rendered as [key]")
+        return res
+    txt = r.stdout
     (pf.workdir / "harvest.txt").write_text(txt, encoding="utf-8")
     parsed = parse_text(txt, len(doc.cites), bib_keys, audit)
     parsed.tex = res.tex

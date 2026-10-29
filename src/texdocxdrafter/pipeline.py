@@ -1,6 +1,8 @@
 """End-to-end orchestration: preflight → parse → harvest → resolve → write → validate → audit."""
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import re
@@ -122,33 +124,78 @@ def default_stylemap_path(pf: Preflight) -> Path:
 
 
 WORK_MARKER = ".texdocxdrafter-work"  # written into a work directory this tool created, so only those are ever removed
+REGISTRY = "outputs.json"  # sha256 of every file this tool wrote, keyed by absolute path
 
 
-def _is_own_output(path: Path) -> bool:
-    """True when ``path`` is a docx written by this tool and not saved since (Word/LibreOffice change lastModifiedBy)."""
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _registry_load(config_dir: Path) -> dict:
     try:
-        with zipfile.ZipFile(path) as z:
-            core = z.read("docProps/core.xml").decode("utf-8", "replace")
-    except (OSError, zipfile.BadZipFile, KeyError):
-        return False
-    return re.search(r"<cp:lastModifiedBy>texdocxdrafter</cp:lastModifiedBy>", core) is not None
+        return json.loads((config_dir / REGISTRY).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
-def output_path(pf: Preflight, out, overwrite: bool = False) -> Path:
+def _registry_save(config_dir: Path, reg: dict) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    write_atomic(config_dir / REGISTRY, json.dumps(reg, indent=1).encode("utf-8"))
+
+
+def _is_own_output(path: Path, reg: dict) -> bool:
+    """True when ``path`` is byte-for-byte a file this tool wrote (recorded hash), so nobody has edited it since."""
+    digest = reg.get(str(path))
+    return bool(digest) and path.is_file() and _sha256(path) == digest
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` through an exclusively created temporary file in the same directory."""
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def vet_target(path: Path, what: str, pf: Preflight, reg: dict, overwrite: bool) -> Path:
+    """Refuse a target that is a source file, a symlink, a directory, or an existing file this tool did not write."""
+    sources = {pf.main.resolve()} | {(pf.srcdir / f).resolve() for f, _ in pf.source.origins if (pf.srcdir / f).exists()}
+    if path.resolve() in sources:
+        raise PreflightError(f"{what} {path.name} is one of the source files")
+    if path.is_symlink():
+        raise PreflightError(f"{what} {path} is a symbolic link; refusing to write through it")
+    if path.exists():
+        if path.is_dir():
+            raise PreflightError(f"{what} {path} is a directory")
+        if not overwrite and not _is_own_output(path, reg):
+            raise PreflightError(f"{path.name} exists and was not written by texdocxdrafter (or has been edited since); "
+                                 "pass --overwrite to replace it")
+    return path
+
+
+def output_path(pf: Preflight, out, overwrite: bool = False, reg: dict | None = None) -> Path:
     """Resolve and vet the output path: a .docx that is not a source file and not someone else's document."""
-    out = Path(out).resolve() if out else pf.main.with_suffix(".docx")
+    out = Path(out).absolute() if out else pf.main.with_suffix(".docx")
     if out.suffix.lower() != ".docx":
         raise PreflightError(f"output must be a .docx file, not {out.name}")
-    sources = {pf.main.resolve()} | {(pf.srcdir / f).resolve() for f, _ in pf.source.origins if (pf.srcdir / f).exists()}
-    if out in sources:
-        raise PreflightError(f"output {out.name} is one of the source files")
-    if out.exists():
-        if out.is_dir():
-            raise PreflightError(f"output {out} is a directory")
-        if not overwrite and not _is_own_output(out):
-            raise PreflightError(f"{out.name} exists and was not written by texdocxdrafter (or has been edited since); "
-                                 "pass --overwrite to replace it")
-    return out
+    return vet_target(out, "output", pf, reg if reg is not None else _registry_load(pf.workdir), overwrite)
+
+
+def report_path(out: Path) -> Path:
+    return out.with_name(out.stem + ".texdocxdrafter-report.md")
 
 
 def _keep_work(run_dir: Path, config_dir: Path, log) -> Path:
@@ -167,7 +214,7 @@ def _keep_work(run_dir: Path, config_dir: Path, log) -> Path:
 
 def build(main, out=None, style_map=None, reference_doc=None, link_citations=False, keep_work=False,
           no_harvest=False, no_tikz=False, validate_lo=False, comments=False, overwrite=False, allow_dirs=(),
-          timeout=sandbox.COMPILE_TIMEOUT, log=print) -> BuildResult:
+          timeout=sandbox.COMPILE_TIMEOUT, trust=False, log=print) -> BuildResult:
     t0 = time.time()
     audit = Audit()
     pf = preflight(main, need_build_files=not no_harvest, allow_dirs=allow_dirs)
@@ -177,14 +224,20 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
     if reference_doc:
         sm["options"]["reference_doc"] = str(reference_doc)
     reference_doc = reference_doc or sm["options"].get("reference_doc")
-    out = output_path(pf, out, overwrite)
+    reg = _registry_load(config_dir)
+    out = output_path(pf, out, overwrite, reg)
+    report = vet_target(report_path(out), "report", pf, reg, overwrite)
     for issue in pf.issues:
         audit.add("preflight", issue)
     audit.info["engine"] = pf.engine
     audit.info["document class"] = pf.docclass
-    audit.info["sandbox"] = ("bubblewrap (read-only file system, no network) plus TeX restrictions"
+    audit.info["sandbox"] = ("bubblewrap (only system, TeX and source directories visible; no network) plus TeX restrictions"
                              if sandbox.have_os_sandbox() else
                              "TeX restrictions and LuaTeX write guard only; install bubblewrap for an OS sandbox")
+    skip_reason = sandbox.side_compiles_allowed(pf.engine, trust)
+    if skip_reason:
+        audit.add("harvest", skip_reason)
+        no_harvest = no_tikz = True
     if pf.numberwithin:
         audit.add("numbering", "numbering is continuous in Word; LaTeX used: " + "; ".join(pf.numberwithin))
 
@@ -218,22 +271,20 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
 
         log(f"writing {out.name}")
         writer = DocxWriter(res, pf, sm, audit, template=reference_doc, link_citations=link_citations)
-        tmp_out = out.with_name(f".{out.stem}.{os.getpid()}.tmp.docx")
-        try:
-            writer.write(tmp_out, comments=comments)
-            os.replace(tmp_out, out)  # atomic: the previous file is never left half written
-        finally:
-            if tmp_out.exists():
-                tmp_out.unlink()
+        buf = io.BytesIO()
+        writer.write(buf, comments=comments)
+        write_atomic(out, buf.getvalue())  # exclusive temporary file, then rename: never half written, never via a symlink
+        reg[str(out)] = _sha256(out)
         chk = check_docx(out)
         for e in chk.errors:
             audit.add("other", f"validation: {e}")
         word_loss(pf, out, audit)
         if validate_lo:
             _libreoffice(out, audit)
-        report = out.with_name(out.stem + ".texdocxdrafter-report.md")
         audit.info["elapsed"] = f"{time.time() - t0:.1f} s"
-        audit.write(report, pf.main.name, stylemap=sm, style_usage=dict(chk.paragraph_styles))
+        write_atomic(report, audit.render(pf.main.name, stylemap=sm, style_usage=dict(chk.paragraph_styles)).encode("utf-8"))
+        reg[str(report)] = _sha256(report)
+        _registry_save(config_dir, reg)
     finally:
         pf.workdir = config_dir
         if keep_work:
