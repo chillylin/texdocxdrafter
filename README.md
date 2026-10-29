@@ -328,6 +328,9 @@ reads only regular files there, never through a symbolic link, and creates its o
   externally linked pictures are removed, as are mail-merge settings and their data sources, because the docx
   asks Word to update all fields on opening so that its own cross-references show the right numbers. The page
   background and its fill, web-layout frames, the view setting and editing or write protection are removed too.
+  Hyperlinks in its headers and footers follow the same rule as the tool's own links: `http`, `https` and
+  `mailto` targets stay links, anything else (network shares, `file:`, `javascript:`, relative paths) becomes
+  plain text.
 - The citation harvest marks its output with a nonce that the `.bib` files never see (random per run; kept in
   `main.texdocxdrafter/harvest.salt` when you compile the side document yourself), so text in a bibliography
   entry cannot pose as a marker and forge or truncate citations. Characters that XML cannot carry are dropped

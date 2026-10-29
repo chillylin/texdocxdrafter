@@ -293,10 +293,15 @@ def strip_inlines(items: list) -> list:
     """Trim leading and trailing whitespace Text and line breaks."""
     from .model import LineBreak, Text
 
+    def blank(x) -> bool:
+        return isinstance(x, LineBreak) or (isinstance(x, Text) and not x.text.strip())
+
     items = list(items)
-    while items and (isinstance(items[0], LineBreak) or (isinstance(items[0], Text) and not items[0].text.strip())):
-        items.pop(0)
-    while items and (isinstance(items[-1], LineBreak) or (isinstance(items[-1], Text) and not items[-1].text.strip())):
+    first = 0  # slice once rather than pop(0) per item: a paragraph of a million \\ would be quadratic
+    while first < len(items) and blank(items[first]):
+        first += 1
+    items = items[first:]
+    while items and blank(items[-1]):
         items.pop()
     if items and isinstance(items[0], Text):
         items[0].text = items[0].text.lstrip(" ")

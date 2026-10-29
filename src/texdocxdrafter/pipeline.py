@@ -57,11 +57,41 @@ _LAYOUT = [
 
 
 def _resolve_flags(body: str, flags: dict) -> str:
-    for name, val in flags.items():
-        pat = re.compile(r"\\if%s\b(.*?)(?:\\else(.*?))?\\fi" % re.escape(name), re.S)
-        body = pat.sub(lambda m: (m.group(1) if val else (m.group(2) or "")), body)
-    body = re.sub(r"\\iffalse.*?\\fi", " ", body, flags=re.S)
-    return body
+    """Keep the taken branch of every ``\\if<flag> … \\else … \\fi`` for the flags of ``\\newif`` (and
+    ``\\iffalse``), in one linear pass: a regex per flag with a lazy body rescans to the end of the text at
+    every occurrence it cannot close."""
+    names = {name: bool(val) for name, val in flags.items()}
+    names["false"] = False
+    tok = re.compile(r"\\(?:if(%s)\b|(else)\b|(fi)\b)" % "|".join(re.escape(n) for n in names))
+    out: list[str] = []
+    stack: list[list] = []  # [flag value, in the else branch] of the open conditionals
+    off = 0  # how many of them are in the branch not taken (kept as a count: the stack can be deep)
+    pos = 0
+    for m in tok.finditer(body):
+        active = off == 0
+        if active:
+            out.append(body[pos:m.start()])
+        pos = m.end()
+        if m.group(1):
+            val = names[m.group(1)]
+            stack.append([val, False])
+            off += not val
+        elif not stack:  # \else or \fi of some other conditional: ordinary text here
+            pos = m.start()
+            continue
+        elif m.group(2):
+            val, in_else = stack[-1]
+            if not in_else:
+                stack[-1][1] = True
+                off += 1 if val else -1
+        else:
+            val, in_else = stack.pop()
+            off -= val == in_else
+        if active:
+            out.append(" ")  # the token itself separated words
+    if off == 0:
+        out.append(body[pos:])
+    return "".join(out)
 
 
 def source_words(pf: Preflight) -> Counter:

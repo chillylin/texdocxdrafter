@@ -25,7 +25,7 @@ from . import images as gfx
 from . import math as omml
 from .textmath import text_math
 from .xmlutil import NSMAP, br, el, field, fld_char, instr, para, q, rpr, run, style_id
-from .xmlutil import xml_safe
+from .xmlutil import safe_url, xml_safe
 
 COLORS = {"red": "FF0000", "blue": "0000FF", "green": "008000", "black": "000000", "gray": "808080",
           "grey": "808080", "orange": "FFA500", "purple": "800080", "cyan": "00FFFF", "magenta": "FF00FF",
@@ -192,12 +192,10 @@ class DocxWriter:
                 out.append(run(str(x), self.cs("todo")))
         return out
 
-    SAFE_SCHEMES = ("http://", "https://", "mailto:")
-
     def hyperlink(self, link: Link, flags: frozenset) -> list:
         """A Word hyperlink for web and mail targets; other schemes (file:, javascript:, UNC paths) stay plain text."""
         runs = self.inl(link.children, flags, link=True)
-        if not (link.url or "").strip().lower().startswith(self.SAFE_SCHEMES):
+        if not safe_url(link.url):
             self.audit.count("link with a non-web target kept as text")
             return runs
         rid = self.d.part.relate_to(link.url, RT.HYPERLINK, is_external=True)

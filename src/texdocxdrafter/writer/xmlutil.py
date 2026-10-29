@@ -26,6 +26,15 @@ def xml_safe(text: str) -> str:
     return _XML_BAD.sub("", text)
 
 
+# the only targets a hyperlink may have, in the writer's own links and in those kept from a reference document
+SAFE_SCHEMES = ("http://", "https://", "mailto:")
+
+
+def safe_url(url: str | None) -> bool:
+    """True for web and mail targets; file:, javascript:, UNC paths and relative paths are not safe."""
+    return (url or "").strip().lower().startswith(SAFE_SCHEMES)
+
+
 def el(tag: str, attrs: dict | None = None, *children, text: str | None = None):
     pre = tag.split(":")[0]
     e = etree.Element(q(tag), nsmap={pre: NSMAP[pre]})

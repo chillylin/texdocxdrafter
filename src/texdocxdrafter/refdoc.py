@@ -17,7 +17,7 @@ from docx.oxml.ns import nsdecls, qn
 
 from .audit import Audit
 from .writer.numbering import NumberingManager
-from .writer.xmlutil import style_id
+from .writer.xmlutil import safe_url, style_id
 
 NS = nsdecls("w")
 
@@ -218,7 +218,7 @@ def _scrub_template(doc) -> None:
     for bg in doc.element.findall(qn("w:background")):
         doc.element.remove(bg)
     for rid, rel in list(part.rels.items()):  # the body is empty now: nothing legitimate points outside
-        if rel.is_external and not rel.reltype.endswith("/hyperlink"):
+        if rel.is_external:
             del part.rels[rid]
     settings = doc.settings.element
     for tag in ("w:attachedTemplate", "w:docVars", "w:mailMerge", "w:displayBackgroundShape", "w:view",
@@ -267,12 +267,42 @@ def _field_name(instr: str) -> str:
     return m.group(1).upper() if m else ""
 
 
+def _safe_field(instr: str) -> bool:
+    """A field a header or footer may keep. HYPERLINK only with a web or mail target (or none: ``\\l`` bookmark
+    links), the same rule as the writer's own links: file paths, UNC shares and javascript: go."""
+    name = _field_name(instr)
+    if name != "HYPERLINK":
+        return name in _SAFE_FIELDS
+    m = re.match(r'\s*HYPERLINK\s*(?:"([^"]*)"|([^\s\\"][^\s]*))', instr or "", re.I)
+    return m is None or safe_url(m.group(1) if m.group(1) is not None else m.group(2))
+
+
+def _unwrap(e) -> None:
+    """Replace element ``e`` by its children (a hyperlink that loses its target keeps its text)."""
+    parent = e.getparent()
+    if parent is None:
+        return
+    for child in list(e):
+        e.addprevious(child)
+    parent.remove(e)
+
+
 def _scrub_story(part) -> None:
     """Drop from a header or footer what could reach outside the document: fields other than the safe set,
-    alternate-format chunks and sub-documents, and anything bound to an external resource except hyperlinks."""
+    alternate-format chunks and sub-documents, and anything bound to an external resource except web and
+    mail hyperlinks."""
     root = part.element
-    for fld in [e for e in root.iter(qn("w:fldSimple")) if _field_name(e.get(qn("w:instr"))) not in _SAFE_FIELDS]:
+    for fld in [e for e in root.iter(qn("w:fldSimple")) if not _safe_field(e.get(qn("w:instr")))]:
         fld.getparent().remove(fld)
+    for h in list(root.iter(qn("w:hyperlink"))):  # w:hyperlink with r:id: keep web and mail targets only
+        rid = h.get(qn("r:id"))
+        if rid is None:
+            continue  # w:anchor: a link inside the document
+        rel = part.rels.get(rid)
+        if rel is None or not rel.is_external or not rel.reltype.endswith("/hyperlink") or not safe_url(rel.target_ref):
+            _unwrap(h)
+            if rel is not None:
+                del part.rels[rid]
     open_fields: list[tuple[list, list]] = []  # (runs, instruction pieces) of the complex fields being read
     doomed: list = []
     for r in list(root.iter(qn("w:r"))):
@@ -284,14 +314,15 @@ def _scrub_story(part) -> None:
             pieces.extend(t.text or "" for t in r.findall(qn("w:instrText")))
         if "end" in kinds and open_fields:
             runs, pieces = open_fields.pop()
-            if _field_name("".join(pieces)) not in _SAFE_FIELDS:
+            if not _safe_field("".join(pieces)):
                 doomed.extend(runs)
     for runs, pieces in open_fields:  # unterminated field: nothing to trust
         doomed.extend(runs)
     for tag in ("w:altChunk", "w:subDoc", "w:contentPart", "w:object", "w:control"):
         doomed.extend(root.iter(qn(tag)))
     gone = {rid for rid, rel in part.rels.items()
-            if (rel.is_external and not rel.reltype.endswith("/hyperlink")) or rel.reltype.endswith(_STORY_RELS)}
+            if (rel.is_external and not (rel.reltype.endswith("/hyperlink") and safe_url(rel.target_ref)))
+            or rel.reltype.endswith(_STORY_RELS)}
     if gone:
         for e in root.iter():
             if any(v in gone for k, v in e.attrib.items() if k.startswith("{%s}" % _R_NS)):

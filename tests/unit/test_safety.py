@@ -1667,3 +1667,96 @@ def test_malformed_numbering_ids_in_template_do_not_crash(tmp_path):
     src = _write(tmp_path, DOC.replace("Hello world.", "\\begin{itemize}\\item one\\end{itemize}"))
     res = build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
     assert res.check.ok, res.check.errors
+
+
+def _template_with_header_links(path: Path) -> dict:
+    """A template whose header carries hyperlinks of every kind: w:hyperlink elements bound to relationships,
+    HYPERLINK fields (simple and complex) and a bookmark link; and a body hyperlink relationship."""
+    import docx
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.oxml import parse_xml
+
+    W = ('xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"')
+    d = docx.Document()
+    d.add_paragraph("body")
+    d.part.relate_to("file:///C:/secret.docx", RT.HYPERLINK, is_external=True)
+    hdr = d.sections[0].header
+    hdr.paragraphs[0].text = "Running head "
+    p = hdr.paragraphs[0]._p
+    rids = {}
+    for key, url in (("web", "https://journal.example/guide"), ("mail", "mailto:editor@example.org"),
+                     ("unc", "\\\\attacker\\share\\x"), ("js", "javascript:alert(1)"),
+                     ("file", "file:///C:/Users/me/notes.docx"), ("rel", "../../hidden.docx")):
+        rids[key] = hdr.part.relate_to(url, RT.HYPERLINK, is_external=True)
+        p.append(parse_xml(f'<w:hyperlink {W} r:id="{rids[key]}"><w:r><w:t>LINK-{key}</w:t></w:r></w:hyperlink>'))
+    for xml in (
+        f'<w:hyperlink {W} w:anchor="top"><w:r><w:t>LINK-anchor</w:t></w:r></w:hyperlink>',
+        f'<w:fldSimple {W} w:instr=" HYPERLINK &quot;https://journal.example/&quot; "><w:r><w:t>FLD-web</w:t></w:r></w:fldSimple>',
+        f'<w:fldSimple {W} w:instr=" HYPERLINK &quot;\\\\\\\\attacker\\\\share&quot; "><w:r><w:t>FLD-unc</w:t></w:r></w:fldSimple>',
+        f'<w:fldSimple {W} w:instr=" HYPERLINK &quot;javascript:alert(1)&quot; "><w:r><w:t>FLD-js</w:t></w:r></w:fldSimple>',
+        f'<w:fldSimple {W} w:instr=" HYPERLINK \\l &quot;top&quot; "><w:r><w:t>FLD-bookmark</w:t></w:r></w:fldSimple>',
+        f'<w:r {W}><w:fldChar w:fldCharType="begin"/></w:r>',
+        f'<w:r {W}><w:instrText xml:space="preserve"> HYPERLINK "file:///C:/evil.hta" </w:instrText></w:r>',
+        f'<w:r {W}><w:fldChar w:fldCharType="separate"/></w:r>',
+        f'<w:r {W}><w:t>FLD-complex-file</w:t></w:r>',
+        f'<w:r {W}><w:fldChar w:fldCharType="end"/></w:r>',
+        f'<w:r {W}><w:fldChar w:fldCharType="begin"/></w:r>',
+        f'<w:r {W}><w:instrText xml:space="preserve"> HYPERLINK "http://journal.example/x" </w:instrText></w:r>',
+        f'<w:r {W}><w:fldChar w:fldCharType="separate"/></w:r>',
+        f'<w:r {W}><w:t>FLD-complex-web</w:t></w:r>',
+        f'<w:r {W}><w:fldChar w:fldCharType="end"/></w:r>',
+    ):
+        p.append(parse_xml(xml))
+    d.save(str(path))
+    return rids
+
+
+def test_template_header_hyperlinks_keep_only_web_and_mail_targets(tmp_path):
+    """N33: hyperlinks kept from a template's header obey the writer's scheme rule (http, https, mailto)."""
+    tpl = tmp_path / "template.docx"
+    _template_with_header_links(tpl)
+    src = _write(tmp_path)
+    res = build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    z = zipfile.ZipFile(tmp_path / "main.docx")
+    names = z.namelist()
+    headers = "".join(z.read(n).decode("utf-8") for n in names if n.startswith("word/header") and n.endswith(".xml"))
+    rels = "".join(z.read(n).decode("utf-8") for n in names if n.startswith("word/_rels/header"))
+    # every link text survives, as text; only web and mail targets are still links
+    for key in ("web", "mail", "unc", "js", "file", "rel", "anchor"):
+        assert f"LINK-{key}" in headers, key
+    assert headers.count("<w:hyperlink") == 3  # web, mail, anchor
+    assert "https://journal.example/guide" in rels and "mailto:editor@example.org" in rels
+    for bad in ("attacker", "javascript", "notes.docx", "hidden.docx", "evil.hta", "secret.docx"):
+        assert bad not in rels and bad not in headers, bad
+    assert "FLD-web" in headers and "FLD-bookmark" in headers and "FLD-complex-web" in headers
+    for gone in ("FLD-unc", "FLD-js", "FLD-complex-file"):
+        assert gone not in headers, gone
+    assert headers.count('w:fldCharType="begin"') == headers.count('w:fldCharType="end"') == 1
+    doc_rels = z.read("word/_rels/document.xml.rels").decode("utf-8")
+    assert "secret.docx" not in doc_rels  # the template body's own external links do not linger in the package
+
+
+def test_unclosed_flag_conditionals_resolve_in_linear_time():
+    """N34: a regex per \\newif flag with a lazy body rescanned to the end at every \\if it could not close."""
+    from texdocxdrafter.pipeline import _resolve_flags
+
+    assert _resolve_flags(r"a \ifdraft B \else C \fi d", {"draft": True}).split() == ["a", "B", "d"]
+    assert _resolve_flags(r"a \ifdraft B \else C \fi d", {"draft": False}).split() == ["a", "C", "d"]
+    assert _resolve_flags(r"x \iffalse gone \fi y", {}).split() == ["x", "y"]
+    assert _resolve_flags(r"\ifdraft \ifnotes X \else W \fi Y \else Z \fi", {"draft": True, "notes": False}).split() == ["W", "Y"]
+    n = 100_000
+    for body, flags in ((r"\ifdraft word " * n, {"draft": True}), (r"\ifdraft word " * n, {"draft": False}),
+                        (r"\iffalse word " * n, {}), (r"\ifa \ifb w " * n, {"a": True, "b": True})):
+        _bounded(lambda: _resolve_flags(body, flags), 10)
+
+
+def test_paragraph_of_many_line_breaks_strips_in_linear_time():
+    """N35: leading line breaks were popped from the front of the list one by one."""
+    from texdocxdrafter.parser.core import strip_inlines
+    from texdocxdrafter.parser.model import LineBreak, Text
+
+    items = [LineBreak() for _ in range(600_000)] + [Text(text=" x ")] + [LineBreak() for _ in range(600_000)]
+    out = _bounded(lambda: strip_inlines(items), 10)
+    assert len(out) == 1 and out[0].text == "x"
