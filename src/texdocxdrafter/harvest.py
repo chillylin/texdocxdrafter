@@ -7,12 +7,14 @@ A side document reuses the original preamble, typesets every citation command in
 from __future__ import annotations
 
 import re
+import secrets
 import shutil
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import sandbox
+from .writer.xmlutil import xml_safe
 from .audit import Audit
 from .parser.model import Bibliography, Document, Run, walk_tree
 from .preflight import Preflight, side_preamble
@@ -96,7 +98,9 @@ def uses_bibtex(doc: Document) -> bool:
     return bool(found)
 
 
-def build_harvest_tex(pf: Preflight, doc: Document) -> tuple[str, list[tuple[int, int]]]:
+def build_harvest_tex(pf: Preflight, doc: Document, nonce: str = "") -> tuple[str, list[tuple[int, int]]]:
+    """The harvest document. ``nonce`` is spliced into every ``@@…@@`` marker (``@@<nonce>CITE 1@@<nonce>``), so
+    that text from a .bib file cannot forge or close a marker: it does not know the nonce."""
     cites = list(doc.cites)
     bibs: list[Bibliography] = []
 
@@ -125,7 +129,7 @@ def build_harvest_tex(pf: Preflight, doc: Document) -> tuple[str, list[tuple[int
         if s > 0:
             out.append("\\end{refsection}")
     out.append("\\end{document}")
-    return "\n".join(out) + "\n", bib_keys
+    return ("\n".join(out) + "\n").replace("@@", "@@" + nonce), bib_keys
 
 
 def compile_harvest(pf: Preflight, tex: str, audit: Audit, timeout: int = sandbox.COMPILE_TIMEOUT) -> Path | None:
@@ -177,17 +181,22 @@ def compile_harvest(pf: Preflight, tex: str, audit: Audit, timeout: int = sandbo
 
 
 _LIG = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ﬅ": "st", "ﬆ": "st"}
-_TOKEN = re.compile(r"@@(/?)(I|B|SUP|SUB)@@")
+
+
+def _marker(pattern: str, nonce: str) -> re.Pattern:
+    """``pattern`` with every ``@@`` standing for the run's marker ``@@<nonce>``."""
+    return re.compile(pattern.replace("@@", re.escape("@@" + nonce)), re.S)
 
 
 def normalise(text: str) -> str:
     text = "".join(_LIG.get(ch, ch) for ch in text)
     text = unicodedata.normalize("NFC", text)
-    return text.replace("­", "").replace("\x0c", "\n")
+    return xml_safe(text.replace("­", "").replace("\x0c", "\n"))
 
 
-def to_runs(s: str) -> list[Run]:
+def to_runs(s: str, nonce: str = "") -> list[Run]:
     """Marked text → runs with formats. Italic markers toggle (an \\emph inside \\emph is upright)."""
+    _TOKEN = _marker(r"@@(/?)(I|B|SUP|SUB)@@", nonce)
     s = re.sub(r"\s+", " ", s)
     runs: list[Run] = []
     depth = {"I": 0, "B": 0, "SUP": 0, "SUB": 0}
@@ -242,24 +251,25 @@ def linkify(runs: list[Run]) -> list[Run]:
     return out
 
 
-def parse_text(text: str, expected_cites: int, bib_keys: list[tuple[int, int]], audit: Audit) -> HarvestResult:
+def parse_text(text: str, expected_cites: int, bib_keys: list[tuple[int, int]], audit: Audit,
+               nonce: str = "") -> HarvestResult:
     res = HarvestResult()
     text = normalise(text)
-    for m in re.finditer(r"@@CITE (\d+)@@(.*?)@@END@@", text, re.S):
-        res.cites[int(m.group(1))] = linkify(to_runs(m.group(2)))
-    for m in re.finditer(r"@@BIB (\d+) (\d+)@@(.*?)@@ENDBIB@@", text, re.S):
+    for m in _marker(r"@@CITE (\d+)@@(.*?)@@END@@", nonce).finditer(text):
+        res.cites[int(m.group(1))] = linkify(to_runs(m.group(2), nonce))
+    for m in _marker(r"@@BIB (\d+) (\d+)@@(.*?)@@ENDBIB@@", nonce).finditer(text):
         key = (int(m.group(1)), int(m.group(2)))
         body = m.group(3)
-        tm = re.search(r"@@TITLE@@(.*?)@@/TITLE@@", body, re.S)
+        tm = _marker(r"@@TITLE@@(.*?)@@/TITLE@@", nonce).search(body)
         if tm:
-            res.titles[key] = to_runs(tm.group(1))
+            res.titles[key] = to_runs(tm.group(1), nonce)
             body = body[:tm.start()] + body[tm.end():]
         entries = []
-        parts = re.split(r"@@ENTRY (\S+?)@@", body)
+        parts = _marker(r"@@ENTRY (\S+?)@@", nonce).split(body)
         lead = parts[0].strip()
         for i in range(1, len(parts), 2):
             ekey, etxt = parts[i], parts[i + 1]
-            runs = linkify(to_runs(etxt))
+            runs = linkify(to_runs(etxt, nonce))
             # numeric styles print a label before the marker: it ends up in the previous chunk
             entries.append((ekey, runs))
         # labels (e.g. "[1]") that precede the next marker are at the tail of the previous chunk; peel them off
@@ -310,7 +320,13 @@ def run_harvest(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandb
         from .bbl import harvest_from_bbl
 
         return harvest_from_bbl(pf, doc, audit)
-    tex, bib_keys = build_harvest_tex(pf, doc)
+    if side is None:
+        nonce = secrets.token_hex(4)  # fresh for this run
+    else:
+        from .sidecompile import harvest_salt
+
+        nonce = harvest_salt(pf, side)  # stable across runs, so the side document does not change every time
+    tex, bib_keys = build_harvest_tex(pf, doc, nonce)
     if side is None:
         pdf = compile_harvest(pf, tex, audit, timeout=timeout)
         res = HarvestResult(tex=pf.workdir / "harvest.tex")
@@ -332,7 +348,7 @@ def run_harvest(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandb
         return res
     txt = r.stdout
     sandbox.write_fresh(pf.workdir / "harvest.txt", txt)
-    parsed = parse_text(txt, len(doc.cites), bib_keys, audit)
+    parsed = parse_text(txt, len(doc.cites), bib_keys, audit, nonce)
     parsed.tex = res.tex
     return parsed
 

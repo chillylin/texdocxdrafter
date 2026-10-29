@@ -11,6 +11,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from docx import Document
+from lxml import etree
 from docx.oxml import parse_xml
 from docx.oxml.ns import nsdecls, qn
 
@@ -213,14 +214,31 @@ def _scrub_template(doc) -> None:
             continue
         for mark in [e for tag in _COMMENT_MARKS for e in el.iter(qn(tag))]:
             mark.getparent().remove(mark)
+    # the page background sits beside w:body, not in it: with displayBackgroundShape Word would fetch its fill
+    for bg in doc.element.findall(qn("w:background")):
+        doc.element.remove(bg)
+    for rid, rel in list(part.rels.items()):  # the body is empty now: nothing legitimate points outside
+        if rel.is_external and not rel.reltype.endswith("/hyperlink"):
+            del part.rels[rid]
     settings = doc.settings.element
-    for tag in ("w:attachedTemplate", "w:docVars", "w:mailMerge"):
+    for tag in ("w:attachedTemplate", "w:docVars", "w:mailMerge", "w:displayBackgroundShape", "w:view",
+                "w:documentProtection", "w:writeProtection"):
         for e in settings.findall(qn(tag)):
             settings.remove(e)
     spart = doc.part.part_related_by("http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings")
     for rid, rel in list(spart.rels.items()):
         if rel.reltype.endswith(("/attachedTemplate", "/mailMergeSource", "/mailMergeHeaderSource", "/recipientData")):
             del spart.rels[rid]
+    for rid, rel in list(part.rels.items()):
+        if rel.reltype.endswith("/webSettings"):  # frames would load their source files in web layout
+            wpart = rel.target_part  # python-docx keeps this part as raw bytes
+            web = etree.fromstring(wpart.blob)
+            for fs in web.findall(qn("w:frameset")):
+                web.remove(fs)
+            wpart._blob = etree.tostring(web, xml_declaration=True, encoding="UTF-8", standalone=True)
+            for wrid, wrel in list(wpart.rels.items()):
+                if wrel.is_external:
+                    del rel.target_part.rels[wrid]
     core = doc.core_properties._element
     for child in list(core):
         core.remove(child)

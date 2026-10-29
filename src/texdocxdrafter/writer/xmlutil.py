@@ -1,6 +1,8 @@
 """Small WordprocessingML element builders (lxml). python-docx has no API for fields, bookmarks, OMML."""
 from __future__ import annotations
 
+import re
+
 from lxml import etree
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -15,16 +17,25 @@ def q(tag: str) -> str:
     return "{%s}%s" % (NSMAP[pre], name)
 
 
+# characters XML 1.0 cannot carry: control characters other than tab/newline/return, lone surrogates, FFFE/FFFF
+_XML_BAD = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+
+
+def xml_safe(text: str) -> str:
+    """``text`` without the characters lxml refuses (they come from pdftotext, .bbl files or the source)."""
+    return _XML_BAD.sub("", text)
+
+
 def el(tag: str, attrs: dict | None = None, *children, text: str | None = None):
     pre = tag.split(":")[0]
     e = etree.Element(q(tag), nsmap={pre: NSMAP[pre]})
     for k, v in (attrs or {}).items():
-        e.set(q(k) if ":" in k else k, str(v))
+        e.set(q(k) if ":" in k else k, xml_safe(str(v)))
     for c in children:
         if c is not None:
             e.append(c)
     if text is not None:
-        e.text = text
+        e.text = xml_safe(text)
     return e
 
 

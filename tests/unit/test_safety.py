@@ -1456,3 +1456,146 @@ def test_timeout_option_has_an_upper_bound(tmp_path, capsys):
     with pytest.raises(SystemExit) as exc:
         main(["build", str(src), "--timeout", str(MAX_TIMEOUT + 1)])
     assert exc.value.code == 2 and "between 1 and" in capsys.readouterr().err
+
+
+# ---- eighth review round -------------------------------------------------------------------------
+
+def _settings_patch(tpl: Path, inject: bytes, rel: bytes | None = None) -> None:
+    """Insert ``inject`` as the first children of w:settings (and a settings relationship)."""
+    with zipfile.ZipFile(tpl) as z:
+        settings = z.read("word/settings.xml")
+        has_rels = "word/_rels/settings.xml.rels" in z.namelist()
+    r_ns = b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    first_child = settings.index(b">", settings.index(b"<w:settings")) + 1
+    patched = settings[:first_child] + inject + settings[first_child:]
+    if r_ns not in patched:
+        patched = patched.replace(b"<w:settings ", b"<w:settings " + r_ns + b" ", 1)
+    replace = {"word/settings.xml": [(settings, patched)]}
+    add = {}
+    if rel:
+        if has_rels:
+            replace["word/_rels/settings.xml.rels"] = [(b"</Relationships>", rel + b"</Relationships>")]
+        else:
+            add["word/_rels/settings.xml.rels"] = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships '
+                                                   b'xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + rel + b"</Relationships>")
+    _rezip(tpl, replace, add)
+
+
+def test_template_background_fill_and_protection_do_not_survive(tmp_path):
+    """N25, N29: w:background (beside the body) with an external fill, displayBackgroundShape, protection."""
+    import docx
+
+    tpl = tmp_path / "template.docx"
+    docx.Document().save(str(tpl))
+    with zipfile.ZipFile(tpl) as z:
+        document = z.read("word/document.xml")
+    bg = (b'<w:background w:color="FFFFFF"><v:background xmlns:v="urn:schemas-microsoft-com:vml">'
+          b'<v:fill src="http://evil.example/track.png" type="frame"/></v:background></w:background>')
+    body_at = document.index(b"<w:body")
+    _rezip(tpl, {"word/document.xml": [(document, document[:body_at] + bg + document[body_at:])]}, {})
+    _settings_patch(tpl, b'<w:writeProtection w:recommended="1"/><w:view w:val="web"/>'
+                         b'<w:documentProtection w:edit="readOnly" w:enforcement="1"/><w:displayBackgroundShape/>')
+    src = _write(tmp_path)
+    res = build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    z = zipfile.ZipFile(tmp_path / "main.docx")
+    blob = b"".join(z.read(n) for n in z.namelist())
+    for gone in (b"w:background", b"evil.example", b"displayBackgroundShape", b"documentProtection", b"writeProtection",
+                 b'w:view w:val="web"'):
+        assert gone not in blob, gone
+
+
+def test_template_web_frameset_is_removed(tmp_path):
+    """N28: a frameset in webSettings.xml names source files Word would load in web layout."""
+    import docx
+
+    tpl = tmp_path / "template.docx"
+    docx.Document().save(str(tpl))
+    W = b'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    with zipfile.ZipFile(tpl) as z:
+        names = z.namelist()
+    if "word/webSettings.xml" in names:
+        with zipfile.ZipFile(tpl) as z:
+            web = z.read("word/webSettings.xml")
+        first_child = web.index(b">", web.index(b"<w:webSettings")) + 1
+        _rezip(tpl, {"word/webSettings.xml": [(web, web[:first_child] + b'<w:frameset><w:frame><w:sourceFileName r:id="rIdF"/></w:frame></w:frameset>' + web[first_child:])]}, {})
+    else:
+        _rezip(tpl, {
+            "[Content_Types].xml": [(b"</Types>", b'<Override PartName="/word/webSettings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.webSettings+xml"/></Types>')],
+            "word/_rels/document.xml.rels": [(b"</Relationships>", b'<Relationship Id="rIdWeb" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/webSettings" Target="webSettings.xml"/></Relationships>')],
+        }, {"word/webSettings.xml": b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:webSettings ' + W
+            + b' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:frameset><w:frame>'
+            b'<w:sourceFileName r:id="rIdF"/></w:frame></w:frameset></w:webSettings>',
+            "word/_rels/webSettings.xml.rels": b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships '
+            b'xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdF" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/frame" Target="http://evil.example/frame.htm" TargetMode="External"/></Relationships>'})
+    src = _write(tmp_path)
+    res = build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    z = zipfile.ZipFile(tmp_path / "main.docx")
+    blob = b"".join(z.read(n) for n in z.namelist())
+    assert b"frameset" not in blob and b"evil.example" not in blob
+
+
+def test_bib_text_cannot_forge_harvest_markers(tmp_path):
+    """N26: markers carry a per-run nonce; '@@END@@' or '@@ENTRY x@@' inside an entry is just text."""
+    from texdocxdrafter.audit import Audit
+    from texdocxdrafter.harvest import parse_text
+
+    n = "0badf00d"
+    text = (f"@@{n}CITE 0@@{n} Smith @@END@@ not the end (2020)@@{n}END@@{n}\n"
+            f"@@{n}BIB 0 0@@{n}\n@@{n}TITLE@@{n} References @@{n}/TITLE@@{n}\n"
+            f"@@{n}ENTRY smith20@@{n} Smith, J. (2020). @@ENTRY injected@@ Fake entry. @@{n}I@@{n}Title@@{n}/I@@{n}.\n"
+            f"@@{n}ENDBIB@@{n}\n")
+    res = parse_text(text, 1, [(0, 0)], Audit(), nonce=n)
+    assert "".join(r.text for r in res.cites[0]) == "Smith @@END@@ not the end (2020)"
+    keys = [k for k, _ in res.bibs[(0, 0)]]
+    assert keys == ["smith20"]
+    assert "@@ENTRY injected@@ Fake entry" in "".join(r.text for r in res.bibs[(0, 0)][0][1])
+    # without the nonce the same text would have been cut and extended
+    res0 = parse_text(text.replace(n, ""), 1, [(0, 0)], Audit())
+    assert [k for k, _ in res0.bibs[(0, 0)]] == ["smith20", "injected"]
+
+
+def test_harvest_document_uses_a_nonce_and_keeps_it_for_user_compiles(tmp_path, monkeypatch):
+    from texdocxdrafter.harvest import build_harvest_tex
+    from texdocxdrafter.pipeline import Registry
+    from texdocxdrafter.sidecompile import SideDir, harvest_salt
+
+    src = _write(tmp_path, CITING_DOC)
+    src.with_suffix(".bbl").write_text("% fake\n")
+    (tmp_path / "refs.bib").write_text(BIB)
+    pf = preflight(src, need_build_files=True)
+    from texdocxdrafter.audit import Audit
+    from texdocxdrafter.parser import parse_document
+
+    doc = parse_document(pf, Audit(), pipeline.stylemap_mod.load(None))
+    tex, _ = build_harvest_tex(pf, doc, "0badf00d")
+    assert "@@0badf00dCITE 0@@0badf00d" in tex and "@@END@@" not in tex
+    cfg = tmp_path / "main.texdocxdrafter"
+    cfg.mkdir()
+    side = SideDir(cfg, Registry(cfg, pf))
+    a = harvest_salt(pf, side)
+    side.registry.save()
+    b = harvest_salt(pf, SideDir(cfg, Registry(cfg, pf)))
+    assert a == b and len(a) == 8
+    (cfg / "harvest.salt").write_text("deadbeef\n")  # a valid salt shipped without the registry is used as is
+    assert harvest_salt(pf, SideDir(cfg, Registry(cfg, pf))) == "deadbeef"
+    (cfg / "harvest.salt").write_text("someone else's file\n")  # anything else is foreign and never replaced
+    with pytest.raises(PreflightError):
+        harvest_salt(pf, SideDir(cfg, Registry(cfg, pf)))
+
+
+def test_control_characters_do_not_crash_the_writer(tmp_path):
+    """N27: characters XML cannot carry are dropped wherever text enters the document."""
+    from texdocxdrafter.harvest import normalise
+    from texdocxdrafter.writer.xmlutil import run, xml_safe
+
+    assert xml_safe("a\x00b\x01c\x0bd\te\nf") == "abcd\te\nf"
+    assert normalise("x\x02y") == "xy"
+    assert run("a\x00b").find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t").text == "ab"
+    src = _write(tmp_path, "\\documentclass{article}\n\\title{T\x01itle}\n\\begin{document}\n\\maketitle\nbad \x00 char\n"
+                 "\\footnote{n\x1fote}\n\\end{document}\n")
+    res = build(src, no_harvest=True, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    assert "bad  char" in _docx_xml(tmp_path / "main.docx") or "bad char" in _docx_xml(tmp_path / "main.docx")

@@ -8,6 +8,7 @@ is newer than a document the tool is recorded as having written.
 """
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +62,23 @@ def _write_side_document(path: Path, text: str, pf: Preflight, registry) -> bool
     commit_file(path, data, _snapshot(path), "side document")
     registry.record(path)
     return True
+
+
+def harvest_salt(pf: Preflight, side: SideDir) -> str:
+    """The marker nonce of the user-compiled harvest: random once, then kept in ``harvest.salt`` so that the side
+    document stays the same between runs. A .bib file shipped by someone else does not know it."""
+    import secrets
+
+    path = side.dir / "harvest.salt"
+    if path.is_file() and not path.is_symlink():
+        # a valid salt is used whether or not the registry records it (an archive shipped without the registry
+        # must still compile the same harvest.tex); anything else there is a foreign file and stops the run below
+        salt = path.read_text(encoding="utf-8", errors="replace").strip()
+        if re.fullmatch(r"[0-9a-f]{8}", salt):
+            return salt
+    salt = secrets.token_hex(4)
+    _write_side_document(path, salt + "\n", pf, side.registry)
+    return salt
 
 
 def user_compiled_pdf(pf: Preflight, side: SideDir, stem: str, text: str, audit: Audit, kind: str,

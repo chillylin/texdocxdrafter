@@ -25,6 +25,7 @@ from . import images as gfx
 from . import math as omml
 from .textmath import text_math
 from .xmlutil import NSMAP, br, el, field, fld_char, instr, para, q, rpr, run, style_id
+from .xmlutil import xml_safe
 
 COLORS = {"red": "FF0000", "blue": "0000FF", "green": "008000", "black": "000000", "gray": "808080",
           "grey": "808080", "orange": "FFA500", "purple": "800080", "cyan": "00FFFF", "magenta": "FF00FF",
@@ -894,7 +895,7 @@ class DocxWriter:
                 p = cands[0] if cands else ranked[-1][1]
             par = Paragraph(p, self.d._body)
             runs = par.runs or [par.add_run("")]
-            self.d.add_comment([runs[0], runs[-1]], text="\n".join(texts), author="LaTeX", initials="TeX")
+            self.d.add_comment([runs[0], runs[-1]], text=xml_safe("\n".join(texts)), author="LaTeX", initials="TeX")
             self.audit.count("LaTeX comments written as Word comments")
 
     def comment_styles(self) -> None:
@@ -1047,9 +1048,9 @@ class DocxWriter:
         _insert_settings(settings, el("w:updateFields", {"w:val": "true"}), after=("w:zoom", "w:removePersonalInformation"))
         cp = self.d.core_properties
         if self.doc.title:
-            cp.title = "".join(_inline_text(self.doc.title))
+            cp.title = xml_safe("".join(_inline_text(self.doc.title)))
         if self.doc.authors:
-            cp.author = "; ".join("".join(_inline_text(a)) for a in self.doc.authors)
+            cp.author = xml_safe("; ".join("".join(_inline_text(a)) for a in self.doc.authors))
         cp.last_modified_by = "texdocxdrafter"  # lets a later run tell its own untouched output from an edited draft
         # a file object (the pipeline writes the bytes itself, atomically) or a path
         self.d.save(out if hasattr(out, "write") else str(out))

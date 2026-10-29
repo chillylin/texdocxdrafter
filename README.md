@@ -323,7 +323,12 @@ reads only regular files there, never through a symbolic link, and creates its o
   make Word fetch other files or URLs (`INCLUDETEXT`, `INCLUDEPICTURE`, `LINK`, `DDE`, `MERGEFIELD`, …) or
   show your file path (`FILENAME`), alternate-format chunks, sub-documents, embedded objects and controls, and
   externally linked pictures are removed, as are mail-merge settings and their data sources, because the docx
-  asks Word to update all fields on opening so that its own cross-references show the right numbers.
+  asks Word to update all fields on opening so that its own cross-references show the right numbers. The page
+  background and its fill, web-layout frames, the view setting and editing or write protection are removed too.
+- The citation harvest marks its output with a nonce that the `.bib` files never see (random per run; kept in
+  `main.texdocxdrafter/harvest.salt` when you compile the side document yourself), so text in a bibliography
+  entry cannot pose as a marker and forge or truncate citations. Characters that XML cannot carry are dropped
+  from all text before it is written.
 - Build files (`.aux`, `.bbl`, `.log`) that are symbolic links to files outside the project are refused, and
   the TikZ side compile receives only the `\newlabel` lines of the `.aux`, never the raw file.
 - Only `http`, `https` and `mailto` targets become Word hyperlinks; `\url` and `\href` with other schemes
