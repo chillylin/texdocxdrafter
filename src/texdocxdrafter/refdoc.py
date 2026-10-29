@@ -214,12 +214,12 @@ def _scrub_template(doc) -> None:
         for mark in [e for tag in _COMMENT_MARKS for e in el.iter(qn(tag))]:
             mark.getparent().remove(mark)
     settings = doc.settings.element
-    for tag in ("w:attachedTemplate", "w:docVars"):
+    for tag in ("w:attachedTemplate", "w:docVars", "w:mailMerge"):
         for e in settings.findall(qn(tag)):
             settings.remove(e)
     spart = doc.part.part_related_by("http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings")
     for rid, rel in list(spart.rels.items()):
-        if rel.reltype.endswith("/attachedTemplate"):
+        if rel.reltype.endswith(("/attachedTemplate", "/mailMergeSource", "/mailMergeHeaderSource", "/recipientData")):
             del spart.rels[rid]
     core = doc.core_properties._element
     for child in list(core):
@@ -241,7 +241,7 @@ def _scrub_template(doc) -> None:
 _SAFE_FIELDS = frozenset("""PAGE NUMPAGES SECTIONPAGES SECTION DATE TIME CREATEDATE SAVEDATE PRINTDATE EDITTIME
 TITLE AUTHOR SUBJECT KEYWORDS COMMENTS REVNUM NUMWORDS NUMCHARS STYLEREF SEQ REF PAGEREF NOTEREF
 TOC INDEX XE TC SYMBOL HYPERLINK QUOTE IF COMPARE SET FORMULA = LISTNUM AUTONUM AUTONUMLGL AUTONUMOUT
-ADVANCE EQ MERGEFIELD""".split())
+ADVANCE EQ""".split())  # not MERGEFIELD: with a w:mailMerge data source Word would connect to it
 
 
 def _field_name(instr: str) -> str:

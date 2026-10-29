@@ -194,19 +194,30 @@ def _find_tex(srcdir: Path, name: str, roots: list[Path] | None = None) -> Path 
     return None
 
 
+MAX_INPUTS = 500  # files included per document, over all chains
+MAX_INPUT_CHARS = 50_000_000  # characters of included text per document
+
+
 def _flatten_file(path: Path, srcdir: Path, stack: tuple[Path, ...], issues: list[str],
                   comments: list[TexComment] | None = None,
-                  roots: list[Path] | None = None) -> list[tuple[str, str, int]]:
+                  roots: list[Path] | None = None, budget: dict | None = None) -> list[tuple[str, str, int]]:
     """Return pieces (text, file, line) for one file with \\input expanded and comments removed.
 
-    Removed comments are appended to ``comments``, except inside environments drawn as pictures."""
+    Removed comments are appended to ``comments``, except inside environments drawn as pictures. The
+    per-chain cycle check does not bound breadth (N files each including the others fan out as N!), so
+    ``budget`` counts inclusions and characters over the whole document."""
     pieces: list[tuple[str, str, int]] = []
     shown = _display(path, srcdir)
+    if budget is None:
+        budget = {"files": 0, "chars": 0, "noted": False}
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        text_all = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         issues.append(f"cannot read {path}: {exc}")
         return pieces
+    budget["files"] += 1
+    budget["chars"] += len(text_all)
+    lines = text_all.splitlines(keepends=True)
     verb_end: str | None = None
     keep_verb = True
     swallow_leading = False
@@ -265,9 +276,15 @@ def _flatten_file(path: Path, srcdir: Path, stack: tuple[Path, ...], issues: lis
             if target in stack or len(stack) > 20:
                 issues.append(f"{shown}:{lineno}: recursive \\input of {target.name}")
                 continue
+            if budget["files"] >= MAX_INPUTS or budget["chars"] >= MAX_INPUT_CHARS:
+                if not budget["noted"]:
+                    budget["noted"] = True
+                    issues.append(f"{shown}:{lineno}: more than {MAX_INPUTS} \\input files or {MAX_INPUT_CHARS // 1000000} "
+                                  "million characters included; further \\input commands are left in place")
+                continue
             if im.start() > pos:
                 pieces.append((text[pos:im.start()], shown, lineno))
-            pieces.extend(_flatten_file(target, srcdir, stack + (target,), issues, comments, roots))
+            pieces.extend(_flatten_file(target, srcdir, stack + (target,), issues, comments, roots, budget))
             pos = im.end()
         pieces.append((text[pos:], shown, lineno))
     return pieces

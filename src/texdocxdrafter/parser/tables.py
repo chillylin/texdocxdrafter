@@ -16,6 +16,9 @@ LONGTABLE_MARKERS = {"endhead", "endfirsthead", "endfoot", "endlastfoot"}
 BODY_RULES = {"hline", "midrule", "cline", "cmidrule", "specialrule", "Xhline", "hdashline"}
 
 
+MAX_COLUMNS = 200  # more than Word can lay out; also bounds *{n}{...}
+
+
 def parse_colspec(spec: str) -> list[tuple[str, float]]:
     """Column spec → list of (alignment l/c/r, relative width or 0)."""
     cols: list[tuple[str, float]] = []
@@ -41,9 +44,10 @@ def parse_colspec(spec: str) -> list[tuple[str, float]]:
             if j < n and spec[j] == "{":
                 inner, j = read_group(spec, j)
                 try:
-                    cols.extend(parse_colspec(inner) * int(cnt.strip()))
+                    cols.extend(parse_colspec(inner) * min(int(cnt.strip()), MAX_COLUMNS))
                 except ValueError:
                     pass
+                del cols[MAX_COLUMNS:]  # *{999999999}{l} is not a table
                 i = j
                 continue
         elif c.isalpha():

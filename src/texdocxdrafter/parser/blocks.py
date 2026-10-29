@@ -72,7 +72,7 @@ class BlockMixin:
         flow.flush()
         return flow.out
 
-    def has_block(self, nodes) -> bool:
+    def has_block(self, nodes, depth: int = 0) -> bool:
         for n in nodes:
             if isinstance(n, LatexEnvironmentNode):
                 return True
@@ -83,7 +83,7 @@ class BlockMixin:
                 return True
             if isinstance(n, LatexMathNode) and n.displaytype == "display":
                 return True
-            if isinstance(n, LatexGroupNode) and self.has_block(n.nodelist):
+            if isinstance(n, LatexGroupNode) and depth < 100 and self.has_block(n.nodelist, depth + 1):
                 return True
         return False
 

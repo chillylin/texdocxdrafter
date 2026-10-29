@@ -64,12 +64,20 @@ def _balanced(text: str, pos: int, open_: str, close: str) -> tuple[str, int]:
         if ch == "\\":
             i += 2
             continue
-        if ch == open_ or (open_ == "[" and ch == "{"):
-            depth += 1 if ch == open_ else 0
-        if ch == "{" and open_ == "[":
-            inner, i = _balanced(text, i, "{", "}")
+        if open_ == "[" and ch == "{":  # a brace group inside an optional argument may contain ] : skip it
+            braces = 0
+            while i < len(text):
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                braces += {"{": 1, "}": -1}.get(text[i], 0)
+                i += 1
+                if braces == 0:
+                    break
             continue
-        if ch == close:
+        if ch == open_:
+            depth += 1
+        elif ch == close:
             depth -= 1
             if depth == 0:
                 return text[pos + 1:i], i + 1

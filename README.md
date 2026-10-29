@@ -154,7 +154,7 @@ and citations and the reference list are read from that file.
 | `--no-tikz` | Skip the `tikzpicture` side compile; pictures stay as visible text |
 | `--comments` | Turn LaTeX `%` comments into Word comments (off by default, since source comments are often private) |
 | `--allow-dir DIR` | Also accept `\input`, `\include` and graphics from `DIR` (repeatable). By default only files under the directory of `main.tex` are read |
-| `--timeout SECONDS` | Limit for each TeX or biber run of the side compiles (default 120) |
+| `--timeout SECONDS` | Limit for each TeX or biber run of the side compiles (default 120, at most 3600) |
 | `--validate-libreoffice` | Also try to open the result with headless LibreOffice, if installed. It runs in the same sandbox as the TeX engines with a private profile; a snap-packaged LibreOffice cannot start there and is reported as such |
 
 With `--no-harvest --no-tikz` the tool only parses; the same is true for BibTeX documents without TikZ.
@@ -320,10 +320,10 @@ reads only regular files there, never through a symbolic link, and creates its o
   template's own text or author travels into your draft. Macro-enabled templates (`.docm`, `.dotm`) are
   refused, and a VBA project inside a `.docx` is dropped. In its headers and footers only fields computed from
   the document itself survive (`PAGE`, `NUMPAGES`, dates, `STYLEREF`, `REF`, `SEQ` and the like); fields that
-  make Word fetch other files or URLs (`INCLUDETEXT`, `INCLUDEPICTURE`, `LINK`, `DDE`, …) or show your file
-  path (`FILENAME`), alternate-format chunks, sub-documents, embedded objects and controls, and externally
-  linked pictures are removed, because the docx asks Word to update all fields on opening so that its own
-  cross-references show the right numbers.
+  make Word fetch other files or URLs (`INCLUDETEXT`, `INCLUDEPICTURE`, `LINK`, `DDE`, `MERGEFIELD`, …) or
+  show your file path (`FILENAME`), alternate-format chunks, sub-documents, embedded objects and controls, and
+  externally linked pictures are removed, as are mail-merge settings and their data sources, because the docx
+  asks Word to update all fields on opening so that its own cross-references show the right numbers.
 - Build files (`.aux`, `.bbl`, `.log`) that are symbolic links to files outside the project are refused, and
   the TikZ side compile receives only the `\newlabel` lines of the `.aux`, never the raw file.
 - Only `http`, `https` and `mailto` targets become Word hyperlinks; `\url` and `\href` with other schemes
@@ -337,8 +337,9 @@ reads only regular files there, never through a symbolic link, and creates its o
   be applied. Style names from the style map must be printable text and are escaped when written into XML.
   Author macro expansion has a budget (20,000 expansions, 2 million characters in total, 200,000 per
   expansion); a runaway definition such as `\newcommand{\dbl}{\dbl\dbl}` stops there with an error in the
-  report and the remaining calls kept as text. A document that nests groups thousands of levels deep is
-  refused with a message rather than a crash.
+  report and the remaining calls kept as text. `\input` expansion stops after 500 files or 50 million
+  characters, a table column spec is capped at 200 columns, and font declarations nest at most 50 deep. A
+  document that nests groups thousands of levels deep is refused with a message rather than a crash.
 
 ## Reading the report
 

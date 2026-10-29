@@ -297,10 +297,10 @@ def report_path(out: Path) -> Path:
 def _keep_work(run_dir: Path, config_dir: Path, log) -> Path:
     """Move the run's work directory under the configuration directory, replacing only a directory this tool made."""
     dest = config_dir / "work"
-    if dest.exists():
-        if dest.is_dir() and (dest / WORK_MARKER).exists():
+    if dest.is_symlink() or dest.exists():
+        if not dest.is_symlink() and dest.is_dir() and (dest / WORK_MARKER).is_file():
             shutil.rmtree(dest)
-        else:
+        else:  # a symlink, a file, or a directory this tool did not make: leave it alone
             dest = config_dir / f"work-{time.strftime('%Y%m%d-%H%M%S')}"
     config_dir.mkdir(parents=True, exist_ok=True)
     shutil.move(str(run_dir), str(dest))

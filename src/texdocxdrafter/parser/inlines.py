@@ -14,6 +14,8 @@ from .model import (
 )
 
 
+MAX_DECLARATION_DEPTH = 50  # nested font declarations (\bfseries ...) in one inline run
+
 class InlineMixin:
     in_footnote: int = 0
 
@@ -21,18 +23,23 @@ class InlineMixin:
     def inlines(self, nodes) -> list:
         """Convert a node list into inline objects."""
         nodes = self.prep(nodes)
-        out: list = []
-        i = 0
-        while i < len(nodes):
-            n = nodes[i]
+        top: list = []
+        out = top
+        levels = [top]  # a declaration (\bfseries) styles the rest of the list: open a nested Styled and go on
+        for n in nodes:
             if isinstance(n, LatexMacroNode) and n.macroname in DECLARATIONS:
-                kind = DECLARATIONS[n.macroname]
-                rest = self.inlines(nodes[i + 1:])
-                out.append(Styled(kind=kind, children=rest, loc=self.loc(n)))
-                break
+                if len(levels) > MAX_DECLARATION_DEPTH:
+                    self.drop(n)  # thousands of declarations in a row: not a document
+                    continue
+                styled = Styled(kind=DECLARATIONS[n.macroname], children=[], loc=self.loc(n))
+                out.append(styled)
+                out = styled.children
+                levels.append(out)
+                continue
             self.inline_node(n, out)
-            i += 1
-        return merge_text(out)
+        for lvl in levels:
+            lvl[:] = merge_text(lvl)
+        return top
 
     def text(self, s: str, node=None) -> Text:
         return Text(text=norm_text(s), loc=self.loc(node))
