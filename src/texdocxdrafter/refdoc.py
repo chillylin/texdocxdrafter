@@ -6,6 +6,7 @@ only missing styles are created (and reported); existing definitions are left al
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from docx import Document
@@ -17,6 +18,7 @@ from .writer.numbering import NumberingManager
 from .writer.xmlutil import style_id
 
 NS = nsdecls("w")
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 # name -> (type, basedOn, next, pPr xml, rPr xml). Sizes are half-points, spacing/indent twips.
 PARAGRAPH = {
@@ -209,6 +211,61 @@ def _scrub_template(doc) -> None:
     now = datetime.now(timezone.utc).replace(microsecond=0)
     doc.core_properties.created = now
     doc.core_properties.modified = now
+    for rid, rel in list(part.rels.items()):
+        if rel.reltype.endswith(("/header", "/footer")):
+            _scrub_story(rel.target_part)
+
+
+# Fields a header or footer may keep: they are computed from the document itself. Everything else goes,
+# in particular INCLUDETEXT, INCLUDEPICTURE, LINK, DDE, DDEAUTO, IMPORT, RD, DATABASE and AUTOTEXT, which
+# make Word fetch local or remote content when the fields are updated, and the writer asks for exactly
+# that (updateFields) so that its own REF and SEQ fields show the right numbers.
+_SAFE_FIELDS = frozenset("""PAGE NUMPAGES SECTIONPAGES SECTION DATE TIME CREATEDATE SAVEDATE PRINTDATE EDITTIME
+TITLE AUTHOR SUBJECT KEYWORDS COMMENTS FILENAME TEMPLATE REVNUM NUMWORDS NUMCHARS STYLEREF SEQ REF PAGEREF NOTEREF
+TOC INDEX XE TC SYMBOL HYPERLINK QUOTE IF COMPARE SET FORMULA = LISTNUM AUTONUM AUTONUMLGL AUTONUMOUT
+ADVANCE EQ MERGEFIELD""".split())
+
+
+def _field_name(instr: str) -> str:
+    m = re.match(r"\s*([A-Za-z=]+)", instr or "")
+    return m.group(1).upper() if m else ""
+
+
+def _scrub_story(part) -> None:
+    """Drop from a header or footer what could reach outside the document: fields other than the safe set,
+    alternate-format chunks and sub-documents, and anything bound to an external resource except hyperlinks."""
+    root = part.element
+    for fld in [e for e in root.iter(qn("w:fldSimple")) if _field_name(e.get(qn("w:instr"))) not in _SAFE_FIELDS]:
+        fld.getparent().remove(fld)
+    open_fields: list[tuple[list, list]] = []  # (runs, instruction pieces) of the complex fields being read
+    doomed: list = []
+    for r in list(root.iter(qn("w:r"))):
+        kinds = [c.get(qn("w:fldCharType")) for c in r.findall(qn("w:fldChar"))]
+        if "begin" in kinds:
+            open_fields.append(([], []))
+        for runs, pieces in open_fields:
+            runs.append(r)
+            pieces.extend(t.text or "" for t in r.findall(qn("w:instrText")))
+        if "end" in kinds and open_fields:
+            runs, pieces = open_fields.pop()
+            if _field_name("".join(pieces)) not in _SAFE_FIELDS:
+                doomed.extend(runs)
+    for runs, pieces in open_fields:  # unterminated field: nothing to trust
+        doomed.extend(runs)
+    for tag in ("w:altChunk", "w:subDoc", "w:contentPart"):
+        doomed.extend(root.iter(qn(tag)))
+    external = {rid for rid, rel in part.rels.items() if rel.is_external and not rel.reltype.endswith("/hyperlink")}
+    if external:
+        for e in root.iter():
+            if any(v in external for k, v in e.attrib.items() if k.startswith("{%s}" % _R_NS)):
+                run = next((a for a in e.iterancestors() if a.tag == qn("w:r")), None)
+                doomed.append(run if run is not None else e)
+        for rid in external:
+            del part.rels[rid]
+    for e in doomed:
+        parent = e.getparent()
+        if parent is not None:
+            parent.remove(e)
 
 
 def _numbering(doc, user: bool) -> NumberingManager:

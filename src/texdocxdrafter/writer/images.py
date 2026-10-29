@@ -63,7 +63,7 @@ def to_raster(path: Path, workdir: Path) -> Path | None:
     key = _cache_key(path, "png,300,first-page")
     out_base = workdir / f"{path.stem}-{key}"
     out = Path(str(out_base) + ".png")  # not with_suffix: a stem such as figure.v1 keeps its dots
-    if out.exists():
+    if sandbox.is_plain_file(out):
         return out
     src = path
     if suf in (".eps", ".ps"):
@@ -73,7 +73,7 @@ def to_raster(path: Path, workdir: Path) -> Path | None:
         r = sandbox.run(["gs", "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-dEPSCrop", "-sDEVICE=pdfwrite",
                          f"-sOutputFile={tmp}", str(path)], cwd=workdir, timeout=sandbox.TOOL_TIMEOUT,
                         max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[workdir], ro=[path.parent])
-        if r.returncode != 0 or not tmp.exists():
+        if r.returncode != 0 or not sandbox.is_plain_file(tmp):
             return None
         src = tmp
         suf = ".pdf"
@@ -84,7 +84,7 @@ def to_raster(path: Path, workdir: Path) -> Path | None:
         r = sandbox.run(["pdftoppm", "-r", str(dpi), "-png", "-singlefile", "-f", "1", "-l", "1", str(src),
                          str(out_base)], cwd=workdir, timeout=sandbox.TOOL_TIMEOUT,
                         max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[workdir], ro=[src.parent])
-        return out if r.returncode == 0 and out.exists() else None
+        return out if r.returncode == 0 and sandbox.is_plain_file(out) else None
     return None
 
 

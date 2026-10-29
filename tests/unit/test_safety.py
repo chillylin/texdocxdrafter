@@ -920,3 +920,258 @@ def test_only_web_and_mail_links_become_hyperlinks(tmp_path):
     assert "file:" not in rels and "javascript:" not in rels
     xml = z.read("word/document.xml").decode()
     assert "file:///etc/passwd" in xml and "click" in xml  # kept as visible text
+
+
+# ---- fifth review round --------------------------------------------------------------------------
+
+LUA_RELATIVE_SYMLINK = r"""\documentclass{article}
+\begin{document}
+\directlua{
+  lfs.mkdir("a") lfs.mkdir("a/b") lfs.mkdir("a/b/c")
+  local r0, e0 = lfs.link("../victim.txt", "harvest.txt", true)
+  lfs.chdir("a/b/c")
+  % checked from the current directory the target looks like work/victim.txt; the kernel resolves it from the
+  % link's own directory, where it is ../victim.txt next to work
+  local r1, e1 = lfs.link("../victim.txt", "../../../harvest.txt", true)
+  local r2, e2 = lfs.chdir("/")
+  texio.write_nl("LINKS:" .. tostring(r0) .. ":" .. tostring(r1) .. ":" .. tostring(r2))
+}
+x
+\end{document}
+"""
+
+
+@pytest.mark.skipif(not HAVE_LUALATEX, reason="lualatex not installed")
+def test_lua_cannot_plant_a_symbolic_link(tmp_path, monkeypatch):
+    """N7: a relative symlink target evaluated after chdir slipped past the guard; no symlinks at all now."""
+    monkeypatch.setitem(sandbox._disabled, "bwrap", True)
+    (tmp_path / "victim.txt").write_text("untouched")
+    work = tmp_path / "work"
+    work.mkdir()
+    tex = work / "evil.tex"
+    tex.write_text(LUA_RELATIVE_SYMLINK)
+    r = sandbox.compile_tex("lualatex", work, "evil", tex, [work], timeout=120, check_policy=False)
+    assert r.returncode != -1, r.stderr
+    log = (work / "evil.log").read_text(errors="replace").replace("\n", "")
+    assert "LINKS:nil:nil:nil" in log, log[-800:]
+    assert not (work / "harvest.txt").is_symlink() and not (work / "harvest.txt").exists()
+    assert not (work / "a" / "b" / "c" / "harvest.txt").exists()
+
+
+def test_work_dir_helpers_never_follow_a_symlink(tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOPSECRET")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "out.txt").symlink_to(victim)
+    (work / "log.txt").symlink_to(secret)
+    (work / "png").symlink_to(tmp_path)
+    assert sandbox.read_untrusted(work / "log.txt") is None and sandbox.read_untrusted_text(work / "log.txt") == ""
+    assert not sandbox.is_plain_file(work / "log.txt") and sandbox.is_plain_file(secret)
+    sandbox.write_fresh(work / "out.txt", "ours")
+    assert victim.read_text() == "untouched"
+    assert sandbox.is_plain_file(work / "out.txt") and (work / "out.txt").read_text() == "ours"
+    d = sandbox.fresh_dir(work / "png")
+    assert d.is_dir() and not d.is_symlink() and sorted(p.name for p in d.iterdir()) == []
+    assert secret.exists() and victim.exists()  # the symlinked directory's content was not removed
+
+
+def _fake_compile(plant):
+    """A compile_tex stand-in: the 'document' leaves whatever ``plant(work)`` creates, and reports success."""
+    import subprocess
+
+    def compile_tex(engine, work, jobname, texfile, dirs, timeout=0, check_policy=True):
+        plant(Path(work))
+        return subprocess.CompletedProcess([engine], 0, "", "")
+
+    return compile_tex
+
+
+def test_planted_symlinks_in_the_harvest_work_dir_are_not_followed(tmp_path, monkeypatch):
+    """N7: the tool writes harvest.txt and reads harvest.log after the compile; neither goes through a link."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOPSECRET")
+    src = _write(tmp_path, CITING_DOC)
+    src.with_suffix(".bbl").write_text("% fake\n")
+    (tmp_path / "refs.bib").write_text(BIB)
+
+    def plant(work):  # called once per engine run
+        if not (work / "harvest.log").is_symlink():
+            (work / "harvest.log").symlink_to(secret)
+            (work / "harvest.pdf").write_bytes(b"%PDF-1.4 fake")
+            (work / "harvest.txt").symlink_to(victim)
+
+    real_run = sandbox.run
+
+    def run(cmd, *a, **k):
+        if cmd[0] == "pdftotext":
+            import subprocess
+            return subprocess.CompletedProcess(cmd, 0, "@@CITE 1@@harvested@@END@@\n", "")
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(sandbox, "have_os_sandbox", lambda: True)
+    monkeypatch.setattr(sandbox, "compile_tex", _fake_compile(plant))
+    monkeypatch.setattr(sandbox, "run", run)
+    res = build(src, keep_work=True, log=lambda *_: None)
+    assert victim.read_text() == "untouched"
+    report = (tmp_path / "main.texdocxdrafter-report.md").read_text()
+    assert "TOPSECRET" not in report
+    txt = tmp_path / "main.texdocxdrafter" / "work" / "harvest.txt"
+    assert txt.is_file() and not txt.is_symlink() and "harvested" in txt.read_text()
+
+
+TIKZ_DOC = r"""\documentclass{article}
+\usepackage{tikz}
+\begin{document}
+A picture: \begin{tikzpicture}\draw (0,0) -- (1,1);\end{tikzpicture}
+\end{document}
+"""
+
+
+def test_planted_tikz_outputs_are_not_followed(tmp_path, monkeypatch):
+    """N7: a symlinked tikz.pdf, tikz.log or png directory left by the compile is ignored, not embedded."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOPSECRET")
+    secret_png = tmp_path / "pngs"
+    secret_png.mkdir()
+    (secret_png / "page-1.png").write_bytes(b"\x89PNG not really")
+    src = _write(tmp_path, TIKZ_DOC)
+
+    def plant(work):
+        (work / "tikz.log").symlink_to(secret)
+        (work / "tikz.pdf").symlink_to(secret)
+        (work / "png").symlink_to(secret_png)
+
+    monkeypatch.setattr(sandbox, "have_os_sandbox", lambda: True)
+    monkeypatch.setattr(sandbox, "compile_tex", _fake_compile(plant))
+    res = build(src, no_harvest=True, log=lambda *_: None)
+    msgs = "\n".join(e.message for e in res.audit.entries)
+    assert "tikz compile failed" in msgs and "TOPSECRET" not in msgs
+    assert not [n for n in zipfile.ZipFile(tmp_path / "main.docx").namelist() if n.startswith("word/media/")]
+    assert (secret_png / "page-1.png").exists()
+
+
+@pytest.mark.skipif(not HAVE_PDFLATEX, reason="pdflatex not installed")
+def test_sandbox_shows_neither_etc_nor_proc(tmp_path):
+    """N9: only the few /etc entries TeX needs are visible; a document cannot typeset /etc/passwd."""
+    if not sandbox.have_os_sandbox():
+        pytest.skip("bubblewrap not available")
+    assert sandbox.run(["cat", "/etc/passwd"], cwd=tmp_path, rw=[], ro=[tmp_path]).returncode != 0
+    assert sandbox.run(["ls", "/proc"], cwd=tmp_path, rw=[], ro=[tmp_path]).returncode != 0
+    if Path("/etc/fonts").is_dir():
+        assert sandbox.run(["ls", "/etc/fonts"], cwd=tmp_path, rw=[], ro=[tmp_path]).returncode == 0
+    work = tmp_path / "work"
+    work.mkdir()
+    tex = work / "peek.tex"
+    tex.write_text(r"""\documentclass{article}
+\begin{document}
+\InputIfFileExists{/etc/passwd}{\typeout{READ-OK}}{\typeout{READ-REFUSED}}
+\InputIfFileExists{/etc/hostname}{\typeout{READ-OK}}{\typeout{READ-REFUSED}}
+x
+\end{document}
+""")
+    sandbox.compile_tex("pdflatex", work, "peek", tex, [work], timeout=120)
+    log = (work / "peek.log").read_text(errors="replace")
+    assert log.count("READ-REFUSED") == 2 and "READ-OK" not in log
+
+
+def _template_with_header_fields(path: Path) -> None:
+    import docx
+    from docx.oxml import parse_xml
+
+    W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    d = docx.Document()
+    p = d.sections[0].header.paragraphs[0]
+    p.text = "Running head "
+    for xml in (
+        f'<w:fldSimple {W} w:instr=" PAGE "><w:r><w:t>1</w:t></w:r></w:fldSimple>',
+        f'<w:fldSimple {W} w:instr=" INCLUDEPICTURE &quot;http://evil.example/x.png&quot; \\d "><w:r><w:t>pic</w:t></w:r></w:fldSimple>',
+        f'<w:r {W}><w:fldChar w:fldCharType="begin"/></w:r>',
+        f'<w:r {W}><w:instrText xml:space="preserve"> INCLUDETEXT "\\\\\\\\evil\\\\share\\\\notes.docx" </w:instrText></w:r>',
+        f'<w:r {W}><w:fldChar w:fldCharType="separate"/></w:r>',
+        f'<w:r {W}><w:t>INCLUDED-SECRET</w:t></w:r>',
+        f'<w:r {W}><w:fldChar w:fldCharType="end"/></w:r>',
+        f'<w:r {W}><w:fldChar w:fldCharType="begin"/></w:r>',
+        f'<w:r {W}><w:instrText xml:space="preserve"> NUMPAGES </w:instrText></w:r>',
+        f'<w:r {W}><w:fldChar w:fldCharType="separate"/></w:r>',
+        f'<w:r {W}><w:t>9</w:t></w:r>',
+        f'<w:r {W}><w:fldChar w:fldCharType="end"/></w:r>',
+    ):
+        p._p.append(parse_xml(xml))
+    d.save(str(path))
+
+
+def test_reference_doc_header_fields_that_fetch_content_are_removed(tmp_path):
+    """N8: INCLUDETEXT/INCLUDEPICTURE in the template's header go; PAGE and NUMPAGES stay."""
+    tpl = tmp_path / "template.docx"
+    _template_with_header_fields(tpl)
+    src = _write(tmp_path)
+    res = build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    z = zipfile.ZipFile(tmp_path / "main.docx")
+    headers = "".join(z.read(n).decode("utf-8") for n in z.namelist() if n.startswith("word/header"))
+    assert "Running head" in headers and " PAGE " in headers and "NUMPAGES" in headers and ">9<" in headers
+    for gone in ("INCLUDETEXT", "INCLUDEPICTURE", "evil", "INCLUDED-SECRET", "notes.docx"):
+        assert gone not in headers, gone
+    assert "w:fldChar" in headers and headers.count('w:fldCharType="begin"') == headers.count('w:fldCharType="end"') == 1
+
+
+def _bounded(fn, seconds=90):
+    import signal
+
+    def alarm(*_):
+        raise AssertionError(f"did not finish within {seconds} s")
+
+    old = signal.signal(signal.SIGALRM, alarm)
+    signal.alarm(seconds)
+    try:
+        return fn()
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+RUNAWAY = {
+    "macro doubling": r"\newcommand{\dbl}{\dbl\dbl}" + "\n" + r"\begin{document}x \dbl y\end{document}",
+    "environment doubling": r"\newenvironment{dd}{\begin{dd}\begin{dd}}{\end{dd}\end{dd}}" + "\n"
+                            + r"\begin{document}\begin{dd}x\end{dd}\end{document}",
+    "math argument doubling": r"\newcommand{\twice}[1]{#1#1}" + "\n" + r"\begin{document}$"
+                              + r"\twice{" * 30 + "x" + "}" * 30 + r"$\end{document}",
+}
+
+
+@pytest.mark.parametrize("name", sorted(RUNAWAY))
+def test_runaway_macro_expansion_is_bounded(tmp_path, name):
+    """N10: exponential expansion stops at the budget, with an error in the report, within seconds."""
+    src = _write(tmp_path, "\\documentclass{article}\n" + RUNAWAY[name] + "\n")
+    res = _bounded(lambda: build(src, no_harvest=True, no_tikz=True, log=lambda *_: None))
+    assert res.check.ok, res.check.errors
+    errors = [e.message for e in res.audit.entries if e.severity == "error"]
+    assert errors and all("expansion stopped" in m or "depth limit" in m for m in errors), errors
+    assert len(res.audit.warnings()) < 20, len(res.audit.warnings())  # one note, not one item per leftover macro
+
+
+def test_deep_nesting_is_an_error_not_a_traceback(tmp_path, capsys):
+    """N10: 3000 nested braces exceed Python's recursion depth; the CLI reports it and writes nothing."""
+    from texdocxdrafter.cli import main
+
+    src = _write(tmp_path, "\\documentclass{article}\n\\begin{document}\n" + "{" * 3000 + "x" + "}" * 3000
+                 + "\n\\end{document}\n")
+    rc = main(["build", str(src), "--no-harvest", "--no-tikz"])
+    assert rc == 1
+    assert "nests groups" in capsys.readouterr().err
+    assert not (tmp_path / "main.docx").exists()
+
+
+def test_tool_process_has_memory_and_cpu_limits():
+    import subprocess
+    import sys
+
+    code = ("import resource; from texdocxdrafter import sandbox; sandbox.limit_self(); "
+            "print(resource.getrlimit(resource.RLIMIT_AS)[0], resource.getrlimit(resource.RLIMIT_CPU)[0])")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.split()
+    assert int(out[0]) <= sandbox.TOOL_MAX_MEMORY and int(out[1]) <= sandbox.TOOL_CPU_SECONDS

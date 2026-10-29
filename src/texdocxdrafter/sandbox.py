@@ -20,6 +20,7 @@ from __future__ import annotations
 import functools
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -27,6 +28,8 @@ COMPILE_TIMEOUT = 120  # seconds, per TeX or biber run
 TOOL_TIMEOUT = 120  # seconds, per converter run
 MAX_FILE_BYTES = 512 * 1024 * 1024  # largest file a child may write
 MAX_CONVERTER_MEMORY = 4 * 1024 * 1024 * 1024  # address-space cap for image converters
+TOOL_MAX_MEMORY = 4 * 1024 * 1024 * 1024  # address-space cap for the tool's own process
+TOOL_CPU_SECONDS = 1800  # CPU-time cap for the tool's own process
 
 _disabled = {"bwrap": False}  # tests flip this to exercise the fallback
 
@@ -96,8 +99,12 @@ def throwaway_texmfvar(work: Path) -> dict:
     return {"TEXMFVAR": str(var), "TEXMFCACHE": str(var) + (":" + real if real else "")}
 
 
-SYSTEM_RO = ("/usr", "/lib", "/lib32", "/lib64", "/bin", "/sbin", "/etc", "/opt", "/var/lib/texmf",
-             "/var/lib/ghostscript", "/var/cache/fontconfig", "/run/current-system")
+# /etc is not bound as a whole: a side compile can typeset any readable file into the harvest text or a
+# picture (\input{/etc/passwd}), so only the entries the engines and converters need are visible.
+SYSTEM_RO = ("/usr", "/lib", "/lib32", "/lib64", "/bin", "/sbin", "/opt", "/var/lib/texmf",
+             "/var/lib/ghostscript", "/var/cache/fontconfig", "/run/current-system",
+             "/etc/fonts", "/etc/texmf", "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d",
+             "/etc/alternatives", "/etc/localtime", "/etc/papersize", "/etc/ghostscript")
 ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TERM", "TZ", "SOURCE_DATE_EPOCH")
 ENV_PREFIXES = ("LC_", "TEXMF", "KPATHSEA", "FONTCONFIG", "OSFONTDIR", "TEXINPUTS", "BIBINPUTS", "BSTINPUTS",
                 "openout_any", "shell_escape", "TMPDIR", "TEMP", "TMP", "XDG_CACHE_HOME", "XDG_CONFIG_HOME")
@@ -133,9 +140,9 @@ def _wrap(cmd: list[str], rw: list[Path], ro: list[Path]) -> list[str]:
     exe = _bwrap() if not _disabled["bwrap"] else None
     if not exe:
         return cmd
-    args = [exe, "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp"]
+    args = [exe, "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp"]  # no /proc: nothing here needs it
     for d in SYSTEM_RO:
-        if Path(d).is_dir():
+        if Path(d).exists():
             args += ["--ro-bind", d, d]
     for d in list(tex_dirs()) + [Path(x) for x in ro]:
         if d.exists():
@@ -225,15 +232,17 @@ local os_remove, os_rename = os.remove, os.rename
 os.remove = function(name) if not permitted(name) then return nil, refuse end return os_remove(name) end
 os.rename = function(a, b) if not (permitted(a) and permitted(b)) then return nil, refuse end return os_rename(a, b) end
 if lfs_ok and lfs then
-  for _, fn in ipairs({ "mkdir", "rmdir", "touch" }) do
+  for _, fn in ipairs({ "mkdir", "rmdir", "touch", "chdir" }) do
     local orig = lfs[fn]
     if orig then lfs[fn] = function(name, ...) if not permitted(name) then return nil, refuse end return orig(name, ...) end end
   end
   local lfs_link = lfs.link
   if lfs_link then
-    lfs.link = function(old, new, ...)
-      if not (permitted(old) and permitted(new)) then return nil, refuse end
-      return lfs_link(old, new, ...)
+    -- hard links only: a symbolic link's target is a string the kernel resolves from the link's own
+    -- directory, not from the current one, so a relative target cannot be checked here
+    lfs.link = function(old, new, symlink, ...)
+      if symlink or not (permitted(old) and permitted(new)) then return nil, refuse end
+      return lfs_link(old, new, false, ...)
     end
   end
 end
@@ -241,12 +250,90 @@ if debug then debug = { traceback = debug.traceback, getinfo = debug.getinfo } e
 """
 
 
+# ---- files in a directory a child process could write to -------------------------------------------
+#
+# After a compile the work directory holds whatever the document (or a converter working on it) chose to
+# create, including symbolic links. The tool never follows one: it reads only regular files, opened with
+# O_NOFOLLOW, and creates its own files afresh, so a planted link can neither leak a file into the docx
+# nor redirect a write outside the work directory.
+
+
+class UntrustedPathError(OSError):
+    """A path in a work directory is not a regular file (a symbolic link, a directory, a device)."""
+
+
+def is_plain_file(path: Path | str) -> bool:
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def read_untrusted(path: Path | str, limit: int = MAX_FILE_BYTES) -> bytes | None:
+    """Bytes of a regular file written by a child process; None when absent or not a regular file."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, "O_NOCTTY", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read(limit)
+    finally:
+        os.close(fd)
+
+
+def read_untrusted_text(path: Path | str, limit: int = MAX_FILE_BYTES) -> str:
+    data = read_untrusted(path, limit)
+    return "" if data is None else data.decode("utf-8", "replace")
+
+
+def write_fresh(path: Path | str, data: bytes | str) -> None:
+    """Create ``path`` as a new regular file, replacing whatever a child left there without following it."""
+    path = Path(path)
+    if path.is_symlink() or path.exists():
+        if path.is_dir() and not path.is_symlink():
+            raise UntrustedPathError(f"{path} is a directory")
+        path.unlink()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data.encode("utf-8") if isinstance(data, str) else data)
+
+
+def fresh_dir(path: Path | str) -> Path:
+    """An empty directory at ``path`` that no child has written to yet."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_dir():
+        if path.is_symlink() or path.exists():
+            path.unlink()
+    else:
+        shutil.rmtree(path)
+    path.mkdir()
+    return path
+
+
+def limit_self(max_memory: int = TOOL_MAX_MEMORY, cpu_seconds: int = TOOL_CPU_SECONDS) -> None:
+    """Resource limits for the tool's own process: a document must not take the machine down with it."""
+    try:
+        import resource
+
+        for res, limit in ((resource.RLIMIT_AS, max_memory), (resource.RLIMIT_CPU, cpu_seconds)):
+            soft, hard = resource.getrlimit(res)
+            if hard != resource.RLIM_INFINITY:
+                limit = min(limit, hard)
+            if soft == resource.RLIM_INFINITY or soft > limit:
+                resource.setrlimit(res, (limit, hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 def lua_guard(work: Path, allowed: list[Path]) -> Path:
     def lit(p: Path) -> str:
         return '"' + str(p.resolve()).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
     guard = work / ".texdocxdrafter-guard.lua"
-    guard.write_text(LUA_GUARD.replace("@@ALLOWED@@", ", ".join(lit(p) for p in allowed)), encoding="utf-8")
+    write_fresh(guard, LUA_GUARD.replace("@@ALLOWED@@", ", ".join(lit(p) for p in allowed)))
     return guard
 
 

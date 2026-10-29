@@ -135,7 +135,7 @@ def compile_harvest(pf: Preflight, tex: str, audit: Audit, timeout: int = sandbo
     (plus ``--allow-dir`` directories) and can write only into ``work``."""
     work = pf.workdir
     work.mkdir(parents=True, exist_ok=True)
-    (work / "harvest.tex").write_text(tex, encoding="utf-8")
+    sandbox.write_fresh(work / "harvest.tex", tex)
     dirs = [pf.srcdir] + list(pf.allow_dirs)
     env = sandbox.tex_env(dirs)
     engine = pf.engine
@@ -158,9 +158,9 @@ def compile_harvest(pf: Preflight, tex: str, audit: Audit, timeout: int = sandbo
             audit.add("harvest", f"bibtex could not open {m}")
         tex_run()
         tex_run()
-    log = work / "harvest.log"
-    if log.exists():
-        text = log.read_text(errors="replace")
+    # whatever the document left in work is untrusted: regular files only, never through a symbolic link
+    text = sandbox.read_untrusted_text(work / "harvest.log")
+    if text:
         missing = sorted(set(re.findall(r"didn't find a database entry for '([^']*)'", text)
                              + re.findall(r"Citation `([^']*)' (?:on page \S+ )?undefined", text)))
         if missing:
@@ -169,11 +169,8 @@ def compile_harvest(pf: Preflight, tex: str, audit: Audit, timeout: int = sandbo
         for bf in sorted(set(re.findall(r"Cannot find '([^']*\.bib)'|Cannot find (\S+\.bib)", text)))[:3]:
             audit.add("harvest", f"bibliography database not found: {bf[0] or bf[1]}")
     pdf = work / "harvest.pdf"
-    if not pdf.exists() or pdf.stat().st_size == 0:
-        log = work / "harvest.log"
-        errs = []
-        if log.exists():
-            errs = [l for l in log.read_text(errors="replace").splitlines() if l.startswith("!")][:5]
+    if not sandbox.is_plain_file(pdf) or pdf.stat().st_size == 0:
+        errs = [l for l in text.splitlines() if l.startswith("!")][:5]
         audit.add("harvest", f"harvest compile failed ({engine}): {'; '.join(errs) or r.stderr[:200]}")
         return None
     return pdf
@@ -334,7 +331,7 @@ def run_harvest(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandb
         audit.add("harvest", f"pdftotext failed: {r.stderr[:200]}; citations rendered as [key]")
         return res
     txt = r.stdout
-    (pf.workdir / "harvest.txt").write_text(txt, encoding="utf-8")
+    sandbox.write_fresh(pf.workdir / "harvest.txt", txt)
     parsed = parse_text(txt, len(doc.cites), bib_keys, audit)
     parsed.tex = res.tex
     return parsed

@@ -8,7 +8,7 @@ from pylatexenc.latex2text import LatexNodes2Text
 
 from .. import lexer
 from ..audit import Audit
-from ..expand import MAX_DEPTH, Expander, resolve_conditionals
+from ..expand import MAX_DEPTH, MAX_EXPANDED_CHARS, MAX_EXPANSIONS, Expander, resolve_conditionals
 from ..lexer import (
     LatexCharsNode, LatexCommentNode, LatexEnvironmentNode, LatexGroupNode, LatexMacroNode, LatexMathNode,
     LatexSpecialsNode,
@@ -189,10 +189,11 @@ class ParserBase:
 
     def _expand_macro(self, node, depth: int) -> list:
         if depth > MAX_DEPTH:
-            self.audit.add("macro", f"\\{node.macroname}: expansion depth limit reached", self.loc(node))
+            self._depth_note(node.macroname, "\\" + node.macroname)
             return [node]
         text = self.ex.expand_macro_node(node)
         if text is None:
+            self._budget_note(node)
             return [node]
         site = self.loc(node)
         self.audit.count(f"\\{node.macroname} (author macro)")
@@ -202,16 +203,46 @@ class ParserBase:
 
     def _expand_env(self, node, depth: int) -> list:
         if depth > MAX_DEPTH:
-            self.audit.add("macro", f"environment {node.environmentname}: expansion depth limit", self.loc(node))
+            self._depth_note(node.environmentname, "environment " + node.environmentname)
             return [node]
         pair = self.ex.expand_env_node(node)
         if pair is None:
+            self._budget_note(node)
             return [node]
         site = self.loc(node)
         self.audit.count(f"{node.environmentname} (author environment)")
         begin = self._tag(self.ex.walk(pair[0]), site)
         end = self._tag(self.ex.walk(pair[1]), site)
         return self.prep(begin + list(node.nodelist) + end, depth + 1)
+
+    def leftover_author_construct(self, name) -> bool:
+        """An author macro or environment left unexpanded because the budget or the depth limit stopped it."""
+        if name not in self.ex.macros and name not in self.ex.envs:
+            return False
+        return self.ex.exhausted or name in self.__dict__.get("_depth_noted", ())
+
+    def _depth_note(self, key: str, what: str) -> None:
+        noted = self.__dict__.setdefault("_depth_noted", set())
+        if key not in noted:  # a recursive definition hits the limit at every leaf: one note per name
+            noted.add(key)
+            self.audit.add("macro", f"{what}: expansion depth limit ({MAX_DEPTH}) reached; the definition is "
+                           "recursive? deeper occurrences are kept as text", None, "error")
+
+    def _budget_note(self, node=None) -> None:
+        if self.ex.exhausted and not getattr(self, "_budget_noted", False):
+            self._budget_noted = True
+            nm = getattr(node, "macroname", None) or getattr(node, "environmentname", None)
+            at = f" at \\{nm}" if nm else " inside a formula"
+            self.audit.add("macro", f"author macro expansion stopped{at}: the document expands to more than "
+                           f"{MAX_EXPANSIONS} macro calls or {MAX_EXPANDED_CHARS // 1000000} million characters "
+                           "(a runaway definition?); further author macros are kept as text",
+                           self.loc(node) if node is not None else None, "error")
+
+    def expand_math(self, s: str) -> str:
+        """String-level expansion of author macros in a formula, within the document's expansion budget."""
+        out = self.ex.expand_text(s)
+        self._budget_note()
+        return out
 
     def _tag(self, nodes, site: Loc | None) -> list:
         def tag(n):
@@ -239,7 +270,8 @@ class ParserBase:
 
         text = node.latex_verbatim()
         nm = getattr(node, "macroname", None) or getattr(node, "environmentname", None) or type(node).__name__
-        self.audit.add("raw", f"{'\\' + nm if nm else ''} kept as text{(': ' + why) if why else ''}", self.loc(node))
+        if not self.leftover_author_construct(nm):  # the budget or depth note said it once
+            self.audit.add("raw", f"{'\\' + nm if nm else ''} kept as text{(': ' + why) if why else ''}", self.loc(node))
         self.audit.count(f"\\{nm} (unsupported)")
         return RawInline(latex=text, loc=self.loc(node))
 

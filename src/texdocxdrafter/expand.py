@@ -15,6 +15,11 @@ from . import lexer
 from .lexer import arg_text, is_macro, macro_args, plain_text
 
 MAX_DEPTH = 24
+# Expansion is bounded in total as well as in depth: \newcommand{\a}{\a\a} doubles at every level, so a
+# depth limit alone lets a one-line document run for hours and exhaust memory.
+MAX_EXPANSIONS = 20_000  # macro and environment expansions per document
+MAX_EXPANDED_CHARS = 2_000_000  # total characters produced by expansion per document
+MAX_EXPANSION_RESULT = 200_000  # characters one expansion may produce
 
 
 @dataclass
@@ -70,6 +75,23 @@ class Expander:
         self.envs: dict[str, EnvDef] = {}
         self.mathops: dict[str, str] = {}
         self.unexpandable: list[tuple[str, tuple | None, str]] = []
+        self.expansions = 0
+        self.expanded_chars = 0
+        self.exhausted = False  # the budget ran out; further author macros stay unexpanded
+        self._context = None
+        self._context_key = None
+
+    def charge(self, text: str) -> bool:
+        """Account for one expansion producing ``text``; False (and ``exhausted``) once the budget is spent."""
+        if self.exhausted:
+            return False
+        self.expansions += 1
+        self.expanded_chars += len(text)
+        if (self.expansions > MAX_EXPANSIONS or self.expanded_chars > MAX_EXPANDED_CHARS
+                or len(text) > MAX_EXPANSION_RESULT):
+            self.exhausted = True
+            return False
+        return True
 
     # -- collection --------------------------------------------------------------------------
     _DEF_RE = re.compile(r"\\(newcommand|renewcommand|providecommand|DeclareRobustCommand|newenvironment|"
@@ -204,12 +226,17 @@ class Expander:
     def context(self):
         from pylatexenc.latexwalker import get_default_latex_context_db  # noqa: F401
 
+        key = (len(self.macros), len(self.envs), len(self.mathops))
+        if self._context is not None and self._context_key == key:
+            return self._context
         base = lexer.build_context()
         macros, envs = self.specs()
         if not macros and not envs:
-            return base
-        ctx = base.filter_context()
-        ctx.add_context_category("author", macros=macros, environments=envs, prepend=True)
+            ctx = base
+        else:
+            ctx = base.filter_context()
+            ctx.add_context_category("author", macros=macros, environments=envs, prepend=True)
+        self._context, self._context_key = ctx, key
         return ctx
 
     def walk(self, text: str) -> list:
@@ -238,18 +265,20 @@ class Expander:
         d = self.macros.get(node.macroname)
         if d is None:
             return None
-        return subst(d.body, self.args_for(node, d.nargs, d.default))
+        text = subst(d.body, self.args_for(node, d.nargs, d.default))
+        return text if self.charge(text) else None
 
     def expand_env_node(self, node) -> tuple[str, str] | None:
         d = self.envs.get(node.environmentname)
         if d is None:
             return None
         args = self.args_for(node, d.nargs, d.default)
-        return subst(d.begin, args), subst(d.end, args)
+        begin, end = subst(d.begin, args), subst(d.end, args)
+        return (begin, end) if self.charge(begin + end) else None
 
     def expand_text(self, s: str, depth: int = 0) -> str:
         """String-level expansion for math: user macros with arguments and DeclareMathOperator names."""
-        if depth > MAX_DEPTH or not (self.macros or self.mathops):
+        if depth > MAX_DEPTH or self.exhausted or not (self.macros or self.mathops):
             return s
         out: list[str] = []
         i = 0
@@ -300,7 +329,11 @@ class Expander:
             i = k
             changed = True
         res = "".join(out)
-        return self.expand_text(res, depth + 1) if changed else res
+        if not changed:
+            return res
+        if not self.charge(res):
+            return s  # budget spent: leave the text as written
+        return self.expand_text(res, depth + 1)
 
 
 # ---- conditionals -------------------------------------------------------------------------

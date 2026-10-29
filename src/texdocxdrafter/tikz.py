@@ -48,8 +48,6 @@ def render_tikz(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandb
         return 0
     work = pf.workdir / "tikz"
     work.mkdir(parents=True, exist_ok=True)
-    for old in work.glob("page-*.png"):
-        old.unlink()
     tex = build_tikz_tex(pf, images)
     labels = aux_labels(pf)  # only the \newlabel lines of the document's .aux: \ref inside a picture prints the LaTeX number
     if side is not None:
@@ -61,15 +59,15 @@ def render_tikz(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandb
                       images[0].loc)
             return 0
     else:
-        (work / "tikz.tex").write_text(tex, encoding="utf-8")
+        sandbox.write_fresh(work / "tikz.tex", tex)
         if labels:
-            (work / "tikz.aux").write_text(labels, encoding="utf-8")
+            sandbox.write_fresh(work / "tikz.aux", labels)
         dirs = [pf.srcdir] + list(pf.allow_dirs)
         r = sandbox.compile_tex(pf.engine, work, "tikz", work / "tikz.tex", dirs, timeout)
         pdf = work / "tikz.pdf"
-        if not pdf.exists() or pdf.stat().st_size == 0:
-            log = work / "tikz.log"
-            errs = [l for l in log.read_text(errors="replace").splitlines() if l.startswith("!")][:3] if log.exists() else []
+        # whatever the document left in work is untrusted: regular files only, never through a symbolic link
+        if not sandbox.is_plain_file(pdf) or pdf.stat().st_size == 0:
+            errs = [l for l in sandbox.read_untrusted_text(work / "tikz.log").splitlines() if l.startswith("!")][:3]
             audit.add("figure", f"tikz compile failed ({pf.engine}): {'; '.join(errs) or r.stderr[:200]}; "
                       f"{len(images)} tikzpicture(s) kept as visible text", images[0].loc)
             return 0
@@ -77,9 +75,11 @@ def render_tikz(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandb
         audit.add("figure", "pdftoppm not found; tikzpicture(s) kept as visible text", images[0].loc)
         return 0
     dpi = safe_dpi(pdf, DPI)
-    sandbox.run(["pdftoppm", "-r", str(dpi), "-png", str(pdf), str(work / "page")], cwd=work,
-                timeout=sandbox.TOOL_TIMEOUT, max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[work], ro=[pdf.parent])
-    pages = sorted(work.glob("page-*.png"), key=lambda p: int(re.search(r"-(\d+)\.png$", p.name).group(1)))
+    png = sandbox.fresh_dir(work / "png")  # the converter's own directory: the engine never wrote here
+    sandbox.run(["pdftoppm", "-r", str(dpi), "-png", str(pdf), str(png / "page")], cwd=png,
+                timeout=sandbox.TOOL_TIMEOUT, max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[png], ro=[pdf.parent])
+    pages = sorted((p for p in png.glob("page-*.png") if sandbox.is_plain_file(p)),
+                   key=lambda p: int(re.search(r"-(\d+)\.png$", p.name).group(1)))
     if len(pages) != len(images):
         audit.add("figure", f"tikz compile gave {len(pages)} page(s) for {len(images)} tikzpicture(s); "
                   "pictures kept as visible text", images[0].loc)

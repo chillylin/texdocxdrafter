@@ -67,7 +67,7 @@ class InlineMixin:
         d = getattr(n, "delimiters", None)
         if d and s.startswith(d[0]) and s.endswith(d[1]) and len(s) >= len(d[0]) + len(d[1]):
             s = s[len(d[0]):len(s) - len(d[1])]
-        return self.ex.expand_text(s.strip())
+        return self.expand_math(s.strip())
 
     # ---------------------------------------------------------------------------------------
     def inline_macro(self, n, out: list) -> None:
@@ -148,7 +148,7 @@ class InlineMixin:
             out.append(Styled(kind="code", children=[Text(text=chars, loc=loc)], loc=loc))
             return
         if name == "ensuremath":
-            out.append(InlineMath(latex=self.ex.expand_text(arg_text(args[0])) if args else "", loc=loc))
+            out.append(InlineMath(latex=self.expand_math(arg_text(args[0])) if args else "", loc=loc))
             return
         if name in ("parbox", "raisebox", "resizebox", "scalebox", "adjustbox"):
             if args:

@@ -291,12 +291,14 @@ How the tool decides:
 
 `texdocxdrafter` reads your sources and writes a docx. It does not compile your paper. biblatex citations and
 TikZ pictures need two side compiles of your own preamble (see "Side compiles"), and the tool runs them itself
-only inside bubblewrap: a sandbox in which the engine sees the system, TeX and cache directories (read-only),
-your document's directories (read-only) and a private work directory holding a throwaway `TEXMFVAR`, with no
-network, shell escape disabled, `openout_any=p`, a filtered environment and limits on time, CPU and output
-size. Without bubblewrap no TeX engine is started;
-you compile the side documents yourself, exactly as you compile the paper. The report's run summary says
-which of the two happened. Image converters (poppler, Ghostscript) run under the same limits.
+only inside bubblewrap: a sandbox in which the engine sees the system and TeX directories and the caches
+(read-only; of `/etc` only the font, TeX, loader and Ghostscript configuration, and no `/proc`), your document's
+directories (read-only) and a private work directory holding a throwaway `TEXMFVAR`, with no network, shell
+escape disabled, `openout_any=p`, a filtered environment and limits on time, CPU and output size. Without
+bubblewrap no TeX engine is started; you compile the side documents yourself, exactly as you compile the paper.
+The report's run summary says which of the two happened. Image converters (poppler, Ghostscript) run under the
+same limits. Whatever a compile or a converter leaves in the work directory is treated as untrusted: the tool
+reads only regular files there, never through a symbolic link, and creates its own files afresh.
 
 - Files are written only to the output `.docx`, its report, and `main.texdocxdrafter/` (the style map, the hash
   registry, the side documents and, with `--keep-work`, a `work/` directory that is replaced on the next run
@@ -314,7 +316,11 @@ which of the two happened. Image converters (poppler, Ghostscript) run under the
 - A reference document is used for its styles, numbering, page setup, headers and footers only. Its comments
   and people list, footnotes and endnotes, glossary, custom XML, custom and extended properties, thumbnail,
   every core property, attached-template path and document variables are removed first, so nothing of the
-  template's own text or author travels into your draft.
+  template's own text or author travels into your draft. In its headers and footers only fields computed from
+  the document itself survive (`PAGE`, `NUMPAGES`, dates, `STYLEREF`, `REF`, `SEQ` and the like); fields that
+  make Word fetch other files or URLs (`INCLUDETEXT`, `INCLUDEPICTURE`, `LINK`, `DDE`, …), alternate-format
+  chunks, sub-documents and externally linked pictures are removed, because the docx asks Word to update
+  all fields on opening so that its own cross-references show the right numbers.
 - Build files (`.aux`, `.bbl`, `.log`) that are symbolic links to files outside the project are refused, and
   the TikZ side compile receives only the `\newlabel` lines of the `.aux`, never the raw file.
 - Only `http`, `https` and `mailto` targets become Word hyperlinks; `\url` and `\href` with other schemes
@@ -323,6 +329,11 @@ which of the two happened. Image converters (poppler, Ghostscript) run under the
   you add directories with `--allow-dir`. A shared preamble in a parent directory therefore needs
   `--allow-dir ..`.
 - Source comments stay out of the docx unless you pass `--comments`.
+- The tool's own process runs under a memory cap (4 GiB of address space) and a CPU-time cap (30 minutes).
+  Author macro expansion has a budget (20,000 expansions, 2 million characters in total, 200,000 per
+  expansion); a runaway definition such as `\newcommand{\dbl}{\dbl\dbl}` stops there with an error in the
+  report and the remaining calls kept as text. A document that nests groups thousands of levels deep is
+  refused with a message rather than a crash.
 
 ## Reading the report
 

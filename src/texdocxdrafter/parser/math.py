@@ -63,7 +63,7 @@ class MathMixin:
         body = re.sub(r"\\end\{%s\}\s*$" % re.escape(name), "", body)
         if name.startswith(("alignat", "flalign")) or name == "alignat":
             body = re.sub(r"^\s*\{\d+\}", "", body)
-        return self.make_display(name, self.ex.expand_text(body.strip()), self.loc(n))
+        return self.make_display(name, self.expand_math(body.strip()), self.loc(n))
 
     def make_display(self, env: str, body: str, loc) -> DisplayMath:
         base = env.rstrip("*")

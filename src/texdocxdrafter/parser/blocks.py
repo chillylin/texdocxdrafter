@@ -244,7 +244,8 @@ class BlockMixin:
             ctx.out.append(RevisionBlock(kind=kind, blocks=self.blocks(n.nodelist), macro=name, loc=loc))
         else:
             ctx.flush()
-            self.audit.add("raw", f"environment {name} kept as visible text", loc)
+            if not self.leftover_author_construct(name):  # the budget or depth note said it once
+                self.audit.add("raw", f"environment {name} kept as visible text", loc)
             self.audit.count(f"environment {name} (unsupported)")
             ctx.out.append(RawBlock(latex=n.latex_verbatim(), reason=f"environment {name}", loc=loc))
 

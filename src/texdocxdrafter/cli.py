@@ -6,7 +6,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import __version__
+from . import __version__, sandbox
 
 
 def _preflight(args, need_build_files=True):
@@ -190,7 +190,17 @@ def main(argv=None) -> int:
     c.set_defaults(fn=cmd_check)
 
     args = ap.parse_args(argv)
-    return args.fn(args)
+    sandbox.limit_self()
+    try:
+        return args.fn(args)
+    except RecursionError:
+        print("texdocxdrafter: the document nests groups or environments more deeply than the parser can follow; "
+              "nothing was written", file=sys.stderr)
+        return 1
+    except MemoryError:
+        print(f"texdocxdrafter: the document needs more than the memory limit of "
+              f"{sandbox.TOOL_MAX_MEMORY // (1024 ** 3)} GiB; nothing was written", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

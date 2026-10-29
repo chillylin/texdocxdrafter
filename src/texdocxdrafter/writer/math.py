@@ -50,6 +50,9 @@ def preprocess(latex: str) -> str:
     return s.strip()
 
 
+MAX_MATH_CHARS = 200_000  # a formula longer than this is not a formula; it stays as text
+
+
 def _unwrap_boxes(root) -> None:
     for box in list(root.iter(q("m:box"))):
         if box.find(q("m:boxPr")) is not None:
@@ -58,11 +61,9 @@ def _unwrap_boxes(root) -> None:
         parent = box.getparent()
         if parent is None:
             continue
-        idx = parent.index(box)
-        kids = list(e) if e is not None else []
+        for c in (list(e) if e is not None else []):
+            box.addprevious(c)  # no index()/insert(): those are linear in the siblings, quadratic overall
         parent.remove(box)
-        for k, c in enumerate(kids):
-            parent.insert(idx + k, c)
 
 
 def _fix_radicals(root) -> None:
@@ -81,6 +82,8 @@ def convert(latex: str):
     import latex2mathml.converter as l2m
     import mathml2omml
 
+    if len(latex) > MAX_MATH_CHARS:
+        raise ValueError(f"formula longer than {MAX_MATH_CHARS} characters")
     src = preprocess(latex)
     if not src:
         raise ValueError("empty formula")
