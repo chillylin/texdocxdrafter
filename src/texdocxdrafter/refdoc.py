@@ -112,6 +112,8 @@ def build_reference(sm: dict, template: str | Path | None = None, audit: Audit |
     for child in list(body):
         if child.tag != qn("w:sectPr"):
             body.remove(child)
+    if user:
+        _drop_comments(doc)
 
     paragraph_names = {v for k, v in sm["paragraph"].items() if k != "heading"} | {f"{sm['paragraph']['heading']} {i}" for i in range(1, 10)}
     char_names = set(sm["character"].values())
@@ -154,6 +156,26 @@ def build_reference(sm: dict, template: str | Path | None = None, audit: Audit |
     if not user:
         _link_styles(doc, nm)
     return doc, nm, {"user_template": user, "missing": missing}
+
+
+_COMMENT_RELS = ("/comments", "/commentsExtended", "/commentsIds", "/commentsExtensible", "/people")
+_COMMENT_MARKS = ("w:commentRangeStart", "w:commentRangeEnd", "w:commentReference")
+
+
+def _drop_comments(doc) -> None:
+    """Remove the template's comment parts (and the people list that names their authors) and any comment
+    markers left in headers, footers or notes. The template's body is gone, so its comments, often private
+    remarks about removed text, must not travel into the generated document."""
+    part = doc.part
+    for rid, rel in list(part.rels.items()):
+        if rel.reltype.endswith(_COMMENT_RELS):
+            del part.rels[rid]
+    for other in part.package.iter_parts():
+        el = getattr(other, "element", None)
+        if el is None or not hasattr(el, "iter"):
+            continue
+        for mark in [e for tag in _COMMENT_MARKS for e in el.iter(qn(tag))]:
+            mark.getparent().remove(mark)
 
 
 def _numbering(doc, user: bool) -> NumberingManager:

@@ -1,11 +1,17 @@
-"""Run external tools (TeX engines, biber, poppler, ghostscript) with limits.
+r"""Run external tools (TeX engines, biber, poppler, ghostscript) with limits.
 
 Every subprocess gets a wall-clock timeout, a CPU-time limit and a cap on the size of files it may
 write, and a filtered environment. Where bubblewrap (``bwrap``) is available, tools run in a mount
 namespace that contains only the system and TeX directories (read-only), the document's input
-directories (read-only) and the run's work directory plus TeX's caches (writable), with no network. TeX engines additionally run with shell escape disabled and ``openout_any=p``; LuaTeX, whose
-Lua ``io`` library ignores ``openout_any``, also loads a small init script that refuses file writes
-outside the allowed directories, so documents stay contained even without bubblewrap.
+directories (read-only) and the run's work directory plus TeX's caches (writable), with no network. TeX
+engines additionally run with shell escape disabled and ``openout_any=p``; LuaTeX, whose Lua ``io``
+library ignores ``openout_any``, also loads a small init script that refuses file writes outside the
+allowed directories.
+
+Without bubblewrap a TeX document can still read any file the user can read (``\input{/abs/path}``,
+``\openin``; TEXINPUTS only steers searching) and LuaTeX documents run Lua code. So ``compile_tex`` is
+the single policy boundary: without an OS sandbox it refuses to run, and the pipeline instead writes the
+side documents for the user to compile with their own TeX setup (see ``sidecompile``).
 """
 from __future__ import annotations
 
@@ -235,9 +241,20 @@ def tex_cmd(engine: str, work: Path, jobname: str, texfile: Path) -> list[str]:
     return cmd
 
 
+class SandboxPolicyError(RuntimeError):
+    """A side compile was requested while no OS sandbox is available."""
+
+
 def compile_tex(engine: str, work: Path, jobname: str, texfile: Path, dirs: list[Path],
-                timeout: int = COMPILE_TIMEOUT) -> subprocess.CompletedProcess:
-    """One engine run inside ``work``; the document may read from ``dirs`` and write only into ``work``."""
+                timeout: int = COMPILE_TIMEOUT, check_policy: bool = True) -> subprocess.CompletedProcess:
+    """One engine run inside ``work``; the document may read from ``dirs`` and write only into ``work``.
+
+    This is the policy boundary for every side compile: it raises SandboxPolicyError unless an OS sandbox
+    is active, whatever path the call came in by. ``check_policy=False`` exists for the tests of the
+    in-TeX restrictions (openout_any, the Lua guard), which are defence in depth inside the sandbox."""
+    reason = sandbox_missing()
+    if reason and check_policy:
+        raise SandboxPolicyError(reason)
     return run(tex_cmd(engine, work, jobname, texfile), cwd=work, env=tex_env(dirs), timeout=timeout, rw=[work], ro=dirs)
 
 
@@ -245,12 +262,9 @@ def is_luatex(engine: str) -> bool:
     return "lua" in Path(engine).name
 
 
-def side_compiles_allowed(engine: str, trust: bool) -> str | None:
-    """None when side compiles may run; otherwise the reason they are skipped.
-
-    LuaTeX documents run Lua code, and the Lua write guard is defence in depth only, so without an
-    OS sandbox they are compiled only when the user vouches for the document with --trust."""
-    if is_luatex(engine) and not have_os_sandbox() and not trust:
-        return ("LuaTeX documents are compiled only inside an OS sandbox (install bubblewrap) or with --trust; "
-                "side compiles skipped")
-    return None
+def sandbox_missing() -> str | None:
+    """None when side compiles may run here; otherwise why the tool will not start a TeX engine itself."""
+    if have_os_sandbox():
+        return None
+    return ("no OS sandbox (bubblewrap) is available, and a TeX document can read any file you can read, "
+            "so the tool does not run a TeX engine itself")

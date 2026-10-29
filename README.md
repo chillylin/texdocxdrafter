@@ -50,10 +50,11 @@ Pure Python plus your existing TeX installation. No pandoc, no LibreOffice, no J
 ## Requirements
 
 - Python 3.12 or newer.
-- A TeX distribution with `pdflatex`/`xelatex`/`lualatex` and `biber` (used for the citation side compile).
+- The TeX distribution that compiled your paper. biblatex citations and TikZ pictures need two small side
+  compiles with the same engine (`pdflatex`/`xelatex`/`lualatex`) and `biber`; see "Side compiles".
 - `pdftotext`, `pdftoppm` and `pdfinfo` (poppler-utils). `gs` (Ghostscript) is needed only for EPS figures.
-- Recommended on Linux: `bwrap` (bubblewrap), which lets the side compiles run in a read-only view of the
-  file system. Without it the tool falls back to TeX's own restrictions plus a LuaTeX write guard.
+- Linux: `bwrap` (bubblewrap) lets the tool run the side compiles itself, in a sandbox. Without it the tool
+  writes the side documents and you compile them.
 
 ## Install
 
@@ -74,7 +75,7 @@ To work on the code itself, see Development at the end.
 ## Before you run it
 
 `texdocxdrafter` works on a document you have already compiled. Next to `main.tex` there must be the `.aux` file
-and, if you use biblatex, the `.bbl` file:
+and the `.bbl` file (required for biblatex; for BibTeX the citations are read from it):
 
 ```
 pdflatex main.tex && biber main && pdflatex main.tex && pdflatex main.tex
@@ -100,6 +101,31 @@ In Word, press `Ctrl+A` then `F9` to refresh all fields (`texdocxdrafter` also s
 Word may ask whether to update them). After that, inserting or moving a section renumbers headings,
 captions, equations and every cross-reference.
 
+## Side compiles
+
+Two things cannot be produced by parsing alone: biblatex citations, whose formatting lives in the style's TeX
+macros, and `tikzpicture` environments, which are TeX programs. For them the tool builds two small side
+documents from your own preamble, `harvest.tex` (every citation command and the bibliography on one huge page)
+and `tikz.tex` (one page per picture), and needs their PDFs.
+
+- **With bubblewrap (`bwrap`, Linux).** The tool compiles them itself, in a sandbox in which the engine sees
+  only the system and TeX directories, your document's directories (read-only) and a private work directory,
+  with no network.
+- **Without bubblewrap (macOS, Windows, Linux without it).** The tool never starts a TeX engine. It writes the
+  side documents into `main.texdocxdrafter/`, finishes the docx with citations as `[key]` and pictures as
+  visible text, and the report gives the exact command to compile them, of the form
+
+  ```
+  cd main.texdocxdrafter && TEXINPUTS="/path/to/paper:" BIBINPUTS="/path/to/paper:" BSTINPUTS="/path/to/paper:" xelatex harvest && biber harvest && xelatex harvest && xelatex harvest
+  ```
+
+  Run it, then rerun `texdocxdrafter build`: the PDFs are picked up. A side document is rewritten only when
+  its content changes, so this step is needed again only after you edit the preamble, a citation or a picture.
+
+BibTeX documents (`\bibliography{...}` with natbib or plain `thebibliography` styles) need no side compile:
+the `.bst` style has already typeset the entries into `main.bbl`, natbib's author-year labels are in it too,
+and citations and the reference list are read from that file.
+
 ## Commands
 
 | Command | Purpose |
@@ -107,7 +133,7 @@ captions, equations and every cross-reference.
 | `texdocxdrafter build main.tex` | Convert to docx and write the report |
 | `texdocxdrafter inventory main.tex` | Print a census of constructs and the Word style each maps to; create `stylemap.yaml` if none exists |
 | `texdocxdrafter parse main.tex` | Dump the parsed document tree as JSON (`--facts` prints preamble facts only) |
-| `texdocxdrafter harvest main.tex` | Run only the citation side compile and print every citation and bibliography entry |
+| `texdocxdrafter harvest main.tex` | Print every citation and bibliography entry as the docx will show them (side compile or `.bbl`) |
 | `texdocxdrafter check out.docx` | Style usage table and structural validation of a docx |
 
 ### `build` options
@@ -120,15 +146,14 @@ captions, equations and every cross-reference.
 | `--link-citations` | Make each citation a hyperlink to its bibliography entry |
 | `-f`, `--overwrite` | Replace an existing output file even if it was not written by `texdocxdrafter` |
 | `--keep-work` | Keep the intermediate files (harvest files, `tree.json`, images) under `main.texdocxdrafter/work/` |
-| `--no-harvest` | Skip the citation side compile; citations appear as `[key]` |
+| `--no-harvest` | Skip citations (no side compile, no `.bbl` reading); they appear as `[key]` |
 | `--no-tikz` | Skip the `tikzpicture` side compile; pictures stay as visible text |
 | `--comments` | Turn LaTeX `%` comments into Word comments (off by default, since source comments are often private) |
 | `--allow-dir DIR` | Also accept `\input`, `\include` and graphics from `DIR` (repeatable). By default only files under the directory of `main.tex` are read |
 | `--timeout SECONDS` | Limit for each TeX or biber run of the side compiles (default 120) |
-| `--trust` | Run the side compiles of a LuaTeX document even when no OS sandbox (bubblewrap) is available |
 | `--validate-libreoffice` | Also try to open the result with headless LibreOffice, if installed |
 
-With `--no-harvest --no-tikz` no TeX engine is run at all.
+With `--no-harvest --no-tikz` the tool only parses; the same is true for BibTeX documents without TikZ.
 
 ## Customising styles
 
@@ -220,7 +245,7 @@ How the tool decides:
   rules, `\multicolumn`, `\multirow`. Rows above the first mid rule become repeating header rows.
 - Figures: `\includegraphics` (PDF, EPS, PNG, JPEG), `subfigure`/`subcaption` panels, `\graphicspath`.
 - TikZ: every `tikzpicture` is drawn in one side compile (the document's own preamble plus the `preview`
-  package, one page per picture, labels taken from the `.aux`) and rasterised at 300 dpi. A picture inside a
+  package, one page per picture, labels taken from the `.aux`; see "Side compiles") and rasterised at 300 dpi. A picture inside a
   float keeps the float's font size and single spacing. If the compile fails, the source stays as visible text.
 - Comments (`--comments`): a comment at the end of a text line, or on its own line within a paragraph, goes on that
   paragraph; a comment line between blocks goes on the next block. Consecutive comment lines become one
@@ -237,7 +262,9 @@ How the tool decides:
   `\newif` conditionals and `\iffalse`.
 - Citations: the biblatex cite family (including `\cites` forms and natbib-style `\citet`/`\citep` with
   `natbib=true`), `\printbibliography`, `refsection`. BibTeX with natbib or plain `thebibliography` styles:
-  `\bibliography{...}` is rendered by `bibtex` with the document's own `.bst` in the side compile.
+  citations and entries are read from the document's own `.bbl` with no compile (natbib author-year and
+  numeric forms, starred and capitalised variants, pre- and post-notes, the bracket and separator options,
+  `sort&compress`, `\bibpunct`, `\setcitestyle`).
 - Review markup: `\add{...}`, `\del{...}`, `addblock` and `delblock` become tracked changes; see
   "Tracked changes from review markup" above.
 - Two columns (`twocolumn` option, `\twocolumn` in the preamble or in a local `.cls`/`.sty` such as
@@ -258,27 +285,27 @@ How the tool decides:
 
 ## What the tool does to your files
 
-`texdocxdrafter` compiles parts of your document twice more (the citation harvest and the TikZ pictures)
-with your own TeX engine, because that is the only way to get biblatex's exact rendering. Those side
-compiles, and the image converters, run in a private temporary directory with shell escape disabled,
-`openout_any=p` and a filtered environment. Where bubblewrap is installed they also run in a sandbox that
-contains only the system and TeX directories (read-only), the document's own directories (read-only) and
-the work directory plus TeX's font caches (writable), with no network: a document cannot read or write
-anything else. Without bubblewrap, pdfTeX and XeTeX are still kept from writing outside the work
-directory by TeX itself, but LuaTeX runs Lua code whose `io` library ignores `openout_any`; a guard script
-refuses such writes, yet it is defence in depth only, so LuaTeX documents are compiled only inside
-bubblewrap or with `--trust`. Every run is limited in time, CPU and output size, and the report's run
-summary says which sandbox was in effect. Even so, a TeX document is a program: convert documents you
-trust, or use `--no-harvest --no-tikz`.
+`texdocxdrafter` reads your sources and writes a docx. It does not compile your paper. biblatex citations and
+TikZ pictures need two side compiles of your own preamble (see "Side compiles"), and the tool runs them itself
+only inside bubblewrap: a sandbox in which the engine sees the system and TeX directories, your document's
+directories (read-only) and a private work directory, with no network, shell escape disabled, `openout_any=p`,
+a filtered environment and limits on time, CPU and output size. Without bubblewrap no TeX engine is started;
+you compile the side documents yourself, exactly as you compile the paper. The report's run summary says
+which of the two happened. Image converters (poppler, Ghostscript) run under the same limits.
 
-- Files are written only to the output `.docx`, its report, and `main.texdocxdrafter/` (the style map and,
-  with `--keep-work`, a `work/` directory that is replaced on the next run only if this tool created it).
+- Files are written only to the output `.docx`, its report, and `main.texdocxdrafter/` (the style map, the hash
+  registry, the side documents and, with `--keep-work`, a `work/` directory that is replaced on the next run
+  only if this tool created it).
   Nothing else next to your sources is created, changed or deleted. The docx is written to a temporary name
   and renamed into place, so an interrupted run never leaves a half-written file.
 - The output and the report are never source files or symbolic links. The tool records a hash of every file
   it writes in `main.texdocxdrafter/outputs.json`; an existing file whose hash does not match, that is, any
   file it did not write or that has been changed since, is not overwritten without `--overwrite`. Files are
-  written through an exclusively created temporary file and renamed into place.
+  written through an exclusively created temporary file and renamed into place, and the target is checked
+  again at that moment: a file that appeared or changed while the conversion ran is left alone. A file at the
+  registry's path that is not a registry this tool wrote, or that is one of your sources, stops the run.
+- A reference document's own comments, and the people list that names their authors, are removed before the
+  template is used, so remarks about the template's text cannot travel into your draft.
 - `\input`, `\include` and graphics are read only from the directory of `main.tex`, symlinks resolved, unless
   you add directories with `--allow-dir`. A shared preamble in a parent directory therefore needs
   `--allow-dir ..`.

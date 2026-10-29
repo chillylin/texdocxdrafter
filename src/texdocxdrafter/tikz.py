@@ -29,8 +29,12 @@ def build_tikz_tex(pf: Preflight, images: list[Image]) -> str:
     return "\n".join(out) + "\n"
 
 
-def render_tikz(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandbox.COMPILE_TIMEOUT) -> int:
-    """Compile every tikzpicture of the tree and set Image.path/width_in. Returns the number rendered."""
+def render_tikz(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandbox.COMPILE_TIMEOUT,
+                side_dir: Path | None = None) -> int:
+    """Compile every tikzpicture of the tree and set Image.path/width_in. Returns the number rendered.
+
+    With ``side_dir`` the side document is written there for the user to compile (no OS sandbox here)
+    and the PDF they produced is used; see sidecompile."""
     images = tikz_images(doc)
     if not images:
         return 0
@@ -38,25 +42,37 @@ def render_tikz(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandb
     work.mkdir(parents=True, exist_ok=True)
     for old in work.glob("page-*.png"):
         old.unlink()
-    (work / "tikz.tex").write_text(build_tikz_tex(pf, images), encoding="utf-8")
-    if pf.aux and Path(pf.aux).exists():
-        # the document's own labels, so \ref inside a picture prints the LaTeX number
-        shutil.copyfile(pf.aux, work / "tikz.aux")
-    dirs = [pf.srcdir] + list(pf.allow_dirs)
-    r = sandbox.compile_tex(pf.engine, work, "tikz", work / "tikz.tex", dirs, timeout)
-    pdf = work / "tikz.pdf"
-    if not pdf.exists() or pdf.stat().st_size == 0:
-        log = work / "tikz.log"
-        errs = [l for l in log.read_text(errors="replace").splitlines() if l.startswith("!")][:3] if log.exists() else []
-        audit.add("figure", f"tikz compile failed ({pf.engine}): {'; '.join(errs) or r.stderr[:200]}; "
-                  f"{len(images)} tikzpicture(s) kept as visible text", images[0].loc)
-        return 0
+    tex = build_tikz_tex(pf, images)
+    aux_ok = bool(pf.aux) and Path(pf.aux).exists()
+    if side_dir is not None:
+        from .sidecompile import user_compiled_pdf
+
+        # the document's own .aux goes next to the side document, so \ref inside a picture prints the LaTeX number
+        pdf = user_compiled_pdf(pf, side_dir, "tikz", tex, audit, "figure",
+                                extra={"tikz.aux": Path(pf.aux)} if aux_ok else None)
+        if pdf is None:
+            audit.add("figure", f"{len(images)} tikzpicture(s) kept as visible text until the side document is compiled",
+                      images[0].loc)
+            return 0
+    else:
+        (work / "tikz.tex").write_text(tex, encoding="utf-8")
+        if aux_ok:
+            shutil.copyfile(pf.aux, work / "tikz.aux")
+        dirs = [pf.srcdir] + list(pf.allow_dirs)
+        r = sandbox.compile_tex(pf.engine, work, "tikz", work / "tikz.tex", dirs, timeout)
+        pdf = work / "tikz.pdf"
+        if not pdf.exists() or pdf.stat().st_size == 0:
+            log = work / "tikz.log"
+            errs = [l for l in log.read_text(errors="replace").splitlines() if l.startswith("!")][:3] if log.exists() else []
+            audit.add("figure", f"tikz compile failed ({pf.engine}): {'; '.join(errs) or r.stderr[:200]}; "
+                      f"{len(images)} tikzpicture(s) kept as visible text", images[0].loc)
+            return 0
     if not shutil.which("pdftoppm"):
         audit.add("figure", "pdftoppm not found; tikzpicture(s) kept as visible text", images[0].loc)
         return 0
     dpi = safe_dpi(pdf, DPI)
     sandbox.run(["pdftoppm", "-r", str(dpi), "-png", str(pdf), str(work / "page")], cwd=work,
-                timeout=sandbox.TOOL_TIMEOUT, max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[work])
+                timeout=sandbox.TOOL_TIMEOUT, max_memory=sandbox.MAX_CONVERTER_MEMORY, rw=[work], ro=[pdf.parent])
     pages = sorted(work.glob("page-*.png"), key=lambda p: int(re.search(r"-(\d+)\.png$", p.name).group(1)))
     if len(pages) != len(images):
         audit.add("figure", f"tikz compile gave {len(pages)} page(s) for {len(images)} tikzpicture(s); "

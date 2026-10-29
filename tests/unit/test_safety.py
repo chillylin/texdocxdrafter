@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from texdocxdrafter import sandbox
+from texdocxdrafter import pipeline
 from texdocxdrafter.pipeline import WORK_MARKER, build, output_path, write_atomic
 from texdocxdrafter.auxreader import read_aux
 from texdocxdrafter.preflight import PreflightError, preflight, side_preamble
@@ -58,7 +59,7 @@ def test_tex_compile_cannot_escape(tmp_path):
 x
 \end{document}
 """ % (victim, shell_mark))
-    r = sandbox.compile_tex("pdflatex", work, "evil", tex, [work], timeout=60)
+    r = sandbox.compile_tex("pdflatex", work, "evil", tex, [work], timeout=60, check_policy=False)
     assert r.returncode != -1
     assert victim.read_text() == "untouched"
     assert not shell_mark.exists()
@@ -259,7 +260,7 @@ def _lua_escape_attempt(tmp_path):
     work.mkdir()
     tex = work / "evil.tex"
     tex.write_text(LUA_EVIL % names)
-    r = sandbox.compile_tex("lualatex", work, "evil", tex, [work], timeout=120)
+    r = sandbox.compile_tex("lualatex", work, "evil", tex, [work], timeout=120, check_policy=False)
     assert r.returncode != -1, r.stderr
     assert (work / "evil.log").exists()
     assert victim.read_text() == "untouched"
@@ -316,7 +317,7 @@ def _lua_chdir_attempt(tmp_path):
     names = {"link": str(tmp_path / "link.txt"), "symlink": str(tmp_path / "symlink.txt"), "secret": str(secret)}
     tex = work / "evil.tex"
     tex.write_text(LUA_CHDIR % names)
-    r = sandbox.compile_tex("lualatex", work, "evil", tex, [work], timeout=120)
+    r = sandbox.compile_tex("lualatex", work, "evil", tex, [work], timeout=120, check_policy=False)
     assert r.returncode != -1, r.stderr
     assert victim.read_text() == "untouched"
     assert not (tmp_path / "link.txt").exists() and not (tmp_path / "symlink.txt").is_symlink()
@@ -337,15 +338,10 @@ def test_os_sandbox_hides_files_outside_the_inputs(tmp_path):
     assert "TOPSECRET" not in log  # the secret next to the work directory is not even readable
 
 
-def test_luatex_without_os_sandbox_requires_trust():
-    assert sandbox.side_compiles_allowed("pdflatex", False) is None
-    assert sandbox.side_compiles_allowed("xelatex", False) is None
-    sandbox._disabled["bwrap"] = True
-    try:
-        assert sandbox.side_compiles_allowed("lualatex", False)
-        assert sandbox.side_compiles_allowed("lualatex", True) is None
-    finally:
-        sandbox._disabled["bwrap"] = False
+def test_no_tex_engine_runs_without_os_sandbox(monkeypatch):
+    assert sandbox.sandbox_missing() is None or not sandbox.have_os_sandbox()
+    monkeypatch.setitem(sandbox._disabled, "bwrap", True)
+    assert "bubblewrap" in sandbox.sandbox_missing()
 
 
 def test_environment_is_filtered():
@@ -433,3 +429,247 @@ def test_aux_self_include_terminates_and_outside_aux_is_ignored(tmp_path):
     finally:
         (tmp_path.parent / "outside.aux").unlink()
     assert set(labels) == {"a", "b"}
+
+
+# ---- third review round --------------------------------------------------------------------------
+
+def test_compile_tex_is_the_policy_boundary(tmp_path, monkeypatch):
+    """Every side compile goes through compile_tex, which refuses to start an engine without an OS sandbox."""
+    monkeypatch.setitem(sandbox._disabled, "bwrap", True)
+    work = tmp_path / "work"
+    work.mkdir()
+    tex = work / "x.tex"
+    tex.write_text(DOC)
+    for engine in ("pdflatex", "xelatex", "lualatex"):
+        with pytest.raises(sandbox.SandboxPolicyError):
+            sandbox.compile_tex(engine, work, "x", tex, [work], timeout=30)
+    assert not (work / "x.log").exists()  # no engine ran
+
+
+def test_harvest_command_without_os_sandbox_writes_the_side_document(tmp_path, monkeypatch, capsys):
+    from texdocxdrafter import cli
+
+    monkeypatch.setitem(sandbox._disabled, "bwrap", True)
+    src = _write(tmp_path)
+    assert cli.main(["harvest", str(src)]) == 1
+    err = capsys.readouterr().err
+    assert "harvest.tex" not in err or "compile" in err
+    assert (tmp_path / "main.texdocxdrafter" / "harvest.tex").is_file()
+    assert "pdflatex harvest" in err
+    assert not list(tmp_path.glob("**/harvest.log"))  # the tool itself ran nothing
+
+
+@pytest.mark.skipif(not HAVE_PDFLATEX, reason="pdflatex not installed")
+def test_pdftex_cannot_read_outside_the_inputs_with_os_sandbox(tmp_path):
+    if not sandbox.have_os_sandbox():
+        pytest.skip("bubblewrap not available")
+    secret = tmp_path / "secret.tex"
+    secret.write_text(r"\message{TOPSECRET}")
+    work = tmp_path / "work"
+    work.mkdir()
+    tex = work / "peek.tex"
+    tex.write_text("\\documentclass{article}\\begin{document}\\input{%s} x\\end{document}\n" % secret)
+    r = sandbox.compile_tex("pdflatex", work, "peek", tex, [work], timeout=60)
+    assert r.returncode != -1
+    assert "TOPSECRET" not in (work / "peek.log").read_text(errors="replace")
+
+
+def _build_with_intervening(src, tmp_path, during, **kw):
+    """Run build(); ``during`` runs after the targets were vetted, before anything is written."""
+    real = pipeline.parse_document
+
+    def hooked(*a, **k):
+        during()
+        return real(*a, **k)
+
+    pipeline.parse_document = hooked
+    try:
+        return build(src, no_harvest=True, log=lambda *_: None, **kw)
+    finally:
+        pipeline.parse_document = real
+
+
+def test_file_created_during_the_run_is_not_overwritten(tmp_path):
+    src = _write(tmp_path)
+    out = tmp_path / "main.docx"
+    with pytest.raises(PreflightError):
+        _build_with_intervening(src, tmp_path, lambda: out.write_text("a coauthor saved this meanwhile"))
+    assert out.read_text() == "a coauthor saved this meanwhile"
+    assert not list(tmp_path.glob(".main.docx.*.tmp"))
+
+
+def test_file_changed_during_the_run_is_not_overwritten(tmp_path):
+    src = _write(tmp_path)
+    out = tmp_path / "main.docx"
+    build(src, no_harvest=True, log=lambda *_: None)  # our own output: a rerun would normally replace it
+    with pytest.raises(PreflightError):
+        _build_with_intervening(src, tmp_path, lambda: out.write_text("edited meanwhile"))
+    assert out.read_text() == "edited meanwhile"
+    # even with --overwrite, a file that changed between vetting and commit is left alone
+    with pytest.raises(PreflightError):
+        _build_with_intervening(src, tmp_path, lambda: out.write_text("edited again"), overwrite=True)
+    assert out.read_text() == "edited again"
+
+
+def test_registry_never_replaces_a_source_or_foreign_file(tmp_path):
+    cfg = tmp_path / "main.texdocxdrafter"
+    cfg.mkdir()
+    reg = cfg / "outputs.json"
+    # 1. the registry path is pulled in as a source file
+    reg.write_text("included text\n")
+    src = _write(tmp_path, DOC.replace("Hello world.", r"\input{main.texdocxdrafter/outputs.json}"))
+    with pytest.raises(PreflightError, match="source"):
+        build(src, no_harvest=True, log=lambda *_: None)
+    assert reg.read_text() == "included text\n"
+    # 2. something that is not a hash registry sits at the path
+    src = _write(tmp_path)
+    for junk in ('{"a": 1}', "not json", "[]"):
+        reg.write_text(junk)
+        with pytest.raises(PreflightError, match="registry"):
+            build(src, no_harvest=True, log=lambda *_: None)
+        assert reg.read_text() == junk
+    # 3. a registry changed by another run between vetting and commit is left alone
+    reg.unlink()
+    build(src, no_harvest=True, log=lambda *_: None)
+    good = reg.read_text()
+    with pytest.raises(PreflightError):
+        _build_with_intervening(src, tmp_path, lambda: reg.write_text("{}"))
+    assert reg.read_text() == "{}"
+    assert good != "{}"
+
+
+def test_reference_doc_comments_do_not_leak(tmp_path):
+    import docx
+
+    tpl = tmp_path / "template.docx"
+    d = docx.Document()
+    para = d.add_paragraph("template body text")
+    d.add_comment(para.runs[0], text="PRIVATE-TEMPLATE-NOTE", author="Reviewer")
+    d.save(str(tpl))
+    assert "word/comments.xml" in zipfile.ZipFile(tpl).namelist()
+
+    src = _write(tmp_path)
+    out = tmp_path / "main.docx"
+    build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
+    z = zipfile.ZipFile(out)
+    assert "word/comments.xml" not in z.namelist()
+    assert all(b"PRIVATE-TEMPLATE-NOTE" not in z.read(n) for n in z.namelist())
+    assert all(b"Reviewer" not in z.read(n) for n in z.namelist() if n.startswith("word/"))
+
+    build(src, reference_doc=tpl, no_harvest=True, comments=True, log=lambda *_: None)
+    z = zipfile.ZipFile(out)
+    comments = z.read("word/comments.xml")
+    assert b"a private note" in comments and b"PRIVATE-TEMPLATE-NOTE" not in comments
+
+
+# ---- side compiles done by the user, and bibtex without any compile -------------------------------
+
+BIBLATEX_DOC = r"""\documentclass{article}
+\usepackage[style=authoryear,backend=biber]{biblatex}
+\usepackage{tikz}
+\addbibresource{refs.bib}
+\begin{document}
+Text \parencite{knuth84} here.
+\begin{figure}\centering\begin{tikzpicture}\draw (0,0) -- (1,1);\end{tikzpicture}\caption{A line.}\end{figure}
+\printbibliography
+\end{document}
+"""
+BIB = r"""@book{knuth84, author={Donald E. Knuth}, title={The TeXbook}, year={1984}, publisher={Addison-Wesley}}
+"""
+
+
+def _docx_xml(path: Path) -> str:
+    return zipfile.ZipFile(path).read("word/document.xml").decode()
+
+
+@pytest.mark.skipif(not (HAVE_PDFLATEX and HAVE_POPPLER and shutil.which("biber")), reason="pdflatex, biber or poppler missing")
+def test_without_os_sandbox_the_user_compiles_the_side_documents(tmp_path, monkeypatch):
+    import subprocess
+
+    src = tmp_path / "main.tex"
+    src.write_text(BIBLATEX_DOC)
+    (tmp_path / "refs.bib").write_text(BIB)
+    # the user's own compile of the paper (this is what the tool assumes exists)
+    for cmd in (["pdflatex", "-interaction=batchmode", "main"], ["biber", "main"], ["pdflatex", "-interaction=batchmode", "main"]):
+        subprocess.run(cmd, cwd=tmp_path, capture_output=True, timeout=120)
+    assert (tmp_path / "main.bbl").is_file()
+
+    monkeypatch.setitem(sandbox._disabled, "bwrap", True)
+    engine_calls = []
+    real_run = sandbox.run
+
+    def spy(cmd, *a, **k):
+        if Path(cmd[0]).name in ("pdflatex", "xelatex", "lualatex", "biber", "bibtex"):
+            engine_calls.append(cmd[0])
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(sandbox, "run", spy)
+    res = build(src, log=lambda *_: None)
+    cfg = tmp_path / "main.texdocxdrafter"
+    assert (cfg / "harvest.tex").is_file() and (cfg / "tikz.tex").is_file()
+    assert not engine_calls  # the tool itself ran no TeX
+    msgs = "\n".join(e.message for e in res.audit.entries)
+    assert "pdflatex harvest" in msgs and "biber harvest" in msgs and "pdflatex tikz" in msgs
+    xml = _docx_xml(tmp_path / "main.docx")
+    assert "[knuth84]" in xml and "Knuth" not in xml
+    assert "word/media/" not in "\n".join(zipfile.ZipFile(tmp_path / "main.docx").namelist())
+
+    # the user runs the two printed commands
+    from texdocxdrafter.sidecompile import compile_command
+    from texdocxdrafter.preflight import preflight
+
+    pf = preflight(src)
+    for stem, bib in (("harvest", "biber"), ("tikz", None)):
+        r = subprocess.run(compile_command(pf, cfg, stem, bib) + " -interaction=batchmode", shell=True,
+                           capture_output=True, text=True, timeout=300)
+        assert (cfg / f"{stem}.pdf").is_file(), r.stdout[-800:]
+    engine_calls.clear()
+    res = build(src, log=lambda *_: None)
+    assert not engine_calls
+    xml = _docx_xml(tmp_path / "main.docx")
+    assert "Knuth" in xml and "1984" in xml and "[knuth84]" not in xml
+    assert any(n.startswith("word/media/") for n in zipfile.ZipFile(tmp_path / "main.docx").namelist())
+    assert res.audit.info["harvest"].startswith("1/1")
+
+
+NATBIB_DOC = r"""\documentclass{article}
+\usepackage[round]{natbib}
+\begin{document}
+As \citet{smith2020a} showed \citep[see][p.~3]{jones2019,smith2020a}.
+\bibliographystyle{plainnat}
+\bibliography{refs}
+\end{document}
+"""
+NATBIB_BBL = r"""\begin{thebibliography}{2}
+\providecommand{\natexlab}[1]{#1}
+\bibitem[Jones and M\"{u}ller(2019)]{jones2019}
+K.~Jones and A.~M\"{u}ller.
+\newblock \emph{A Book About Stuff}.
+\newblock Publisher \& Sons, 2019.
+
+\bibitem[{Smith et~al.(2020{\natexlab{a}})Smith, Jones, and Lee}]{smith2020a}
+J.~Smith, K.~Jones, and M.~Lee.
+\newblock The title of the paper.
+\newblock {\em Journal of Things}, 12(3):45--67, 2020{\natexlab{a}}.
+
+\end{thebibliography}
+"""
+
+
+def test_bibtex_document_needs_no_compile(tmp_path, monkeypatch):
+    src = _write(tmp_path, NATBIB_DOC)
+    src.with_suffix(".bbl").write_text(NATBIB_BBL)
+    monkeypatch.setitem(sandbox._disabled, "bwrap", True)
+    monkeypatch.setattr(sandbox, "compile_tex", lambda *a, **k: pytest.fail("a TeX engine was started"))
+    res = build(src, log=lambda *_: None)
+    assert res.audit.info["harvest source"].startswith("main.bbl")
+    assert res.audit.info["harvest"] == "2/2 citations, 2 bibliography entries"
+    xml = _docx_xml(tmp_path / "main.docx")
+    assert "Smith et al. (2020a)" in xml
+    assert "(see Jones and Müller, 2019; Smith et al., 2020a, p. 3)" in xml
+    assert "Journal of Things" in xml and "Publisher &amp; Sons" in xml
+    import re
+
+    italic = re.findall(r"<w:r>(?:(?!</w:r>).)*(?:<w:i/>|w:val=\"Emphasis\")(?:(?!</w:r>).)*<w:t[^>]*>([^<]*)</w:t>", xml, re.S)
+    assert "Journal of Things" in italic and "A Book About Stuff" in italic
+    assert not (tmp_path / "main.texdocxdrafter" / "harvest.tex").exists()

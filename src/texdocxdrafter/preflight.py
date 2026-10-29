@@ -145,10 +145,11 @@ _SIDE_PATHS = re.compile(r"\\(input|include|addbibresource|bibliography|graphics
 def side_preamble(pf: "Preflight") -> str:
     """The original preamble for a side compile that runs in a private directory.
 
-    TeX does not search TEXINPUTS for explicitly relative names (``../shared/preamble``), so such
-    \\input, \\addbibresource, \\bibliography and \\graphicspath arguments are rewritten to absolute paths
-    when the target lies in an allowed directory. Others are left as they are and fail in the side
-    compile, which the report shows."""
+    Relative \\input, \\include, \\addbibresource, \\bibliography and \\graphicspath arguments are rewritten
+    to absolute paths when the target lies in an allowed directory, so the side document compiles from
+    any directory (TeX does not search TEXINPUTS for explicitly relative names such as ``../shared/x``,
+    and a user compiling the side document by hand has no TEXINPUTS at all). Names that resolve nowhere
+    are left as they are and fail in the side compile, which the report shows."""
     text = pf.orig_preamble
     roots = [pf.srcdir] + list(pf.allow_dirs)
     exts = {"input": (".tex",), "include": (".tex",), "addbibresource": (), "bibliography": (".bib",),
@@ -156,7 +157,7 @@ def side_preamble(pf: "Preflight") -> str:
 
     def rebase(name: str, kinds) -> str:
         name = name.strip()
-        if not (name.startswith("../") or name.startswith("./") or name.startswith("..\\")):
+        if not name or name.startswith("/") or re.match(r"[A-Za-z]:[\\/]", name):
             return name
         for ext in list(kinds) + [""]:
             cand = pf.srcdir / (name + ext)
@@ -170,8 +171,7 @@ def side_preamble(pf: "Preflight") -> str:
         inner, end = _read_balanced(text, m.end() - 1)
         cmd = m.group(1)
         if cmd == "graphicspath":
-            new = re.sub(r"\{([^{}]*)\}", lambda g: "{" + rebase(g.group(1), ()).rstrip("/") + "/}"
-                         if g.group(1).strip().startswith((".", "..")) else g.group(0), inner)
+            new = re.sub(r"\{([^{}]*)\}", lambda g: "{" + rebase(g.group(1).rstrip("/"), ()).rstrip("/") + "/}", inner)
         elif cmd == "bibliography":
             new = ",".join(rebase(part, exts[cmd]) for part in inner.split(","))
         else:

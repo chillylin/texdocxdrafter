@@ -135,16 +135,47 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _registry_path(config_dir: Path) -> Path:
+    return config_dir / REGISTRY
+
+
 def _registry_load(config_dir: Path) -> dict:
+    """The hash registry, or {} when there is none. A file that is not a registry this tool wrote is an error:
+    the file is never silently replaced."""
+    path = _registry_path(config_dir)
+    if path.is_symlink() or path.is_dir():
+        raise PreflightError(f"{path} is a symbolic link or a directory; refusing to use it as the hash registry")
     try:
-        return json.loads((config_dir / REGISTRY).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
+    except OSError as exc:
+        raise PreflightError(f"cannot read {path}: {exc}")
+    try:
+        reg = json.loads(text)
+    except ValueError:
+        reg = None
+    if not isinstance(reg, dict) or not all(isinstance(k, str) and isinstance(v, str) and _HEX64.match(v)
+                                            for k, v in reg.items()):
+        raise PreflightError(f"{path} is not a texdocxdrafter hash registry (a JSON object of path: sha256); "
+                             "move it away to continue")
+    return reg
 
 
-def _registry_save(config_dir: Path, reg: dict) -> None:
-    config_dir.mkdir(parents=True, exist_ok=True)
-    write_atomic(config_dir / REGISTRY, json.dumps(reg, indent=1).encode("utf-8"))
+def _registry_vet(config_dir: Path, pf: Preflight) -> Path:
+    """The registry path, checked not to collide with a source file (``\\input{main.texdocxdrafter/outputs.json}``)."""
+    path = _registry_path(config_dir)
+    if path.resolve() in _source_files(pf):
+        raise PreflightError(f"{path} is one of the document's source files; the hash registry cannot live there")
+    return path
+
+
+def _registry_save(path: Path, reg: dict, snapshot: str | None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    commit_file(path, json.dumps(reg, indent=1).encode("utf-8"), snapshot, "hash registry")
 
 
 def _is_own_output(path: Path, reg: dict) -> bool:
@@ -153,27 +184,73 @@ def _is_own_output(path: Path, reg: dict) -> bool:
     return bool(digest) and path.is_file() and _sha256(path) == digest
 
 
-def write_atomic(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` through an exclusively created temporary file in the same directory."""
+def _snapshot(path: Path) -> str | None:
+    """sha256 of the vetted target as it is now, or None when it does not exist (so the commit must create it)."""
+    return _sha256(path) if path.is_file() else None
+
+
+def _write_tmp(path: Path, data: bytes) -> str:
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    return tmp
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` through an exclusively created temporary file in the same directory."""
+    tmp = _write_tmp(path, data)
+    try:
         os.replace(tmp, path)
     except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        os.unlink(tmp)
         raise
+
+
+def commit_file(path: Path, data: bytes, snapshot: str | None, what: str = "file") -> None:
+    """Write ``data`` to a target vetted earlier, refusing if the target changed meanwhile.
+
+    ``snapshot`` is what ``_snapshot`` returned at vetting time. None: the target did not exist, so it is
+    created exclusively and anything that appeared since is left alone. Otherwise the current content must
+    still hash to ``snapshot`` right before it is replaced."""
+    tmp = _write_tmp(path, data)
+    try:
+        if snapshot is None:
+            try:
+                os.link(tmp, path)  # fails with EEXIST if anything, even a symlink, appeared at the target
+            except FileExistsError:
+                raise PreflightError(f"{what} {path} appeared while the document was being converted; "
+                                     "not touching it (rerun to replace it if it is yours)")
+            except OSError:  # hard links unsupported here: exclusive create, then write
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+            return
+        if path.is_symlink() or not path.is_file() or _sha256(path) != snapshot:
+            raise PreflightError(f"{what} {path} was changed by something else while the document was being "
+                                 "converted; not touching it (rerun to replace it if it is yours)")
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _source_files(pf: Preflight) -> set[Path]:
+    return {pf.main.resolve()} | {(pf.srcdir / f).resolve() for f, _ in pf.source.origins if (pf.srcdir / f).exists()}
 
 
 def vet_target(path: Path, what: str, pf: Preflight, reg: dict, overwrite: bool) -> Path:
     """Refuse a target that is a source file, a symlink, a directory, or an existing file this tool did not write."""
-    sources = {pf.main.resolve()} | {(pf.srcdir / f).resolve() for f, _ in pf.source.origins if (pf.srcdir / f).exists()}
-    if path.resolve() in sources:
+    if path.resolve() in _source_files(pf):
         raise PreflightError(f"{what} {path.name} is one of the source files")
     if path.is_symlink():
         raise PreflightError(f"{what} {path} is a symbolic link; refusing to write through it")
@@ -214,7 +291,7 @@ def _keep_work(run_dir: Path, config_dir: Path, log) -> Path:
 
 def build(main, out=None, style_map=None, reference_doc=None, link_citations=False, keep_work=False,
           no_harvest=False, no_tikz=False, validate_lo=False, comments=False, overwrite=False, allow_dirs=(),
-          timeout=sandbox.COMPILE_TIMEOUT, trust=False, log=print) -> BuildResult:
+          timeout=sandbox.COMPILE_TIMEOUT, log=print) -> BuildResult:
     t0 = time.time()
     audit = Audit()
     pf = preflight(main, need_build_files=not no_harvest, allow_dirs=allow_dirs)
@@ -224,20 +301,22 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
     if reference_doc:
         sm["options"]["reference_doc"] = str(reference_doc)
     reference_doc = reference_doc or sm["options"].get("reference_doc")
+    reg_path = _registry_vet(config_dir, pf)
     reg = _registry_load(config_dir)
     out = output_path(pf, out, overwrite, reg)
     report = vet_target(report_path(out), "report", pf, reg, overwrite)
+    # what the vetted targets look like now; the commit at the end refuses if anything changed them meanwhile
+    snaps = {out: _snapshot(out), report: _snapshot(report), reg_path: _snapshot(reg_path)}
     for issue in pf.issues:
         audit.add("preflight", issue)
     audit.info["engine"] = pf.engine
     audit.info["document class"] = pf.docclass
+    # without an OS sandbox the tool runs no TeX engine: side documents go to the config dir for the user to compile
+    side_dir = None if sandbox.have_os_sandbox() else config_dir
     audit.info["sandbox"] = ("bubblewrap (only system, TeX and source directories visible; no network) plus TeX restrictions"
-                             if sandbox.have_os_sandbox() else
-                             "TeX restrictions and LuaTeX write guard only; install bubblewrap for an OS sandbox")
-    skip_reason = sandbox.side_compiles_allowed(pf.engine, trust)
-    if skip_reason:
-        audit.add("harvest", skip_reason)
-        no_harvest = no_tikz = True
+                             if side_dir is None else
+                             f"none (no bubblewrap): no TeX engine was run; side documents are written to {config_dir.name}/ "
+                             "for you to compile")
     if pf.numberwithin:
         audit.add("numbering", "numbering is continuous in Word; LaTeX used: " + "; ".join(pf.numberwithin))
 
@@ -257,8 +336,9 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
         elif not pf.uses_biblatex and not harvest_mod.uses_bibtex(doc):
             audit.add("harvest", "document uses neither biblatex nor \\bibliography: citations rendered as [key]")
         else:
-            log("harvesting citations with %s (side compile)" % ("biblatex" if pf.uses_biblatex else "bibtex"))
-            hv = harvest_mod.run_harvest(pf, doc, audit, timeout=timeout)
+            log("harvesting citations with biblatex (side compile)" if pf.uses_biblatex else
+                f"reading citations from {pf.bbl.name}")
+            hv = harvest_mod.run_harvest(pf, doc, audit, timeout=timeout, side_dir=side_dir)
             audit.info["harvest"] = f"{len(hv.cites)}/{len(doc.cites)} citations, " \
                                     f"{sum(len(v) for v in hv.bibs.values())} bibliography entries"
         pictures = tikz_mod.tikz_images(doc)
@@ -266,14 +346,14 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
             audit.add("figure", f"{len(pictures)} tikzpicture(s) kept as visible text (--no-tikz)", pictures[0].loc)
         elif pictures:
             log("rendering tikzpicture environments")
-            tikz_mod.render_tikz(pf, doc, audit, timeout=timeout)
+            tikz_mod.render_tikz(pf, doc, audit, timeout=timeout, side_dir=side_dir)
         res = resolve(doc, pf, audit, hv)
 
         log(f"writing {out.name}")
         writer = DocxWriter(res, pf, sm, audit, template=reference_doc, link_citations=link_citations)
         buf = io.BytesIO()
         writer.write(buf, comments=comments)
-        write_atomic(out, buf.getvalue())  # exclusive temporary file, then rename: never half written, never via a symlink
+        commit_file(out, buf.getvalue(), snaps[out], "output")  # exclusive temp file; refuses if the target changed since vetting
         reg[str(out)] = _sha256(out)
         chk = check_docx(out)
         for e in chk.errors:
@@ -282,9 +362,10 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
         if validate_lo:
             _libreoffice(out, audit)
         audit.info["elapsed"] = f"{time.time() - t0:.1f} s"
-        write_atomic(report, audit.render(pf.main.name, stylemap=sm, style_usage=dict(chk.paragraph_styles)).encode("utf-8"))
+        commit_file(report, audit.render(pf.main.name, stylemap=sm, style_usage=dict(chk.paragraph_styles)).encode("utf-8"),
+                    snaps[report], "report")
         reg[str(report)] = _sha256(report)
-        _registry_save(config_dir, reg)
+        _registry_save(reg_path, reg, snaps[reg_path])
     finally:
         pf.workdir = config_dir
         if keep_work:

@@ -27,8 +27,7 @@ def cmd_build(args) -> int:
         res = build(args.main, out=args.output, style_map=args.style_map, reference_doc=args.reference_doc,
                     link_citations=args.link_citations, keep_work=args.keep_work, no_harvest=args.no_harvest,
                     no_tikz=args.no_tikz, validate_lo=args.validate_libreoffice, comments=args.comments,
-                    overwrite=args.overwrite, allow_dirs=args.allow_dir or (), timeout=args.timeout,
-                    trust=args.trust)
+                    overwrite=args.overwrite, allow_dirs=args.allow_dir or (), timeout=args.timeout)
     except PreflightError as exc:
         print(f"texdocxdrafter: {exc}", file=sys.stderr)
         return 2
@@ -92,14 +91,19 @@ def cmd_harvest(args) -> int:
     import shutil
     import tempfile
 
+    from . import sandbox
+
     pf = _preflight(args)
     audit = Audit()
     doc = parse_document(pf, audit)
-    pf.workdir = Path(tempfile.mkdtemp(prefix="texdocxdrafter-"))  # side compile in a private directory
+    config_dir = pf.workdir
+    side_dir = None if sandbox.have_os_sandbox() else config_dir  # no sandbox: the user compiles the side document
+    pf.workdir = Path(tempfile.mkdtemp(prefix="texdocxdrafter-"))  # intermediate files in a private directory
     try:
-        res = harvest.run_harvest(pf, doc, audit, timeout=args.timeout)
+        res = harvest.run_harvest(pf, doc, audit, timeout=args.timeout, side_dir=side_dir)
     finally:
         shutil.rmtree(pf.workdir, ignore_errors=True)
+        pf.workdir = config_dir
     for i in sorted(res.cites):
         print(f"[{i}] " + "".join(_fmt(r) for r in res.cites[i]))
     for key, entries in res.bibs.items():
@@ -148,8 +152,6 @@ def main(argv=None) -> int:
     b.add_argument("--allow-dir", action="append", metavar="DIR",
                    help="additional directory that \\input and graphics may come from (repeatable)")
     b.add_argument("--timeout", type=int, default=120, metavar="SECONDS", help="limit per TeX/biber run (default 120)")
-    b.add_argument("--trust", action="store_true",
-                   help="run the side compiles of a LuaTeX document even without an OS sandbox (bubblewrap)")
     b.add_argument("--validate-libreoffice", action="store_true")
     b.set_defaults(fn=cmd_build)
 

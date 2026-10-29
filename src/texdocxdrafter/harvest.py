@@ -302,17 +302,34 @@ def _attach_labels(entries: list[tuple[str, list[Run]]]) -> list[tuple[str, list
     return out
 
 
-def run_harvest(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandbox.COMPILE_TIMEOUT) -> HarvestResult:
+def run_harvest(pf: Preflight, doc: Document, audit: Audit, timeout: int = sandbox.COMPILE_TIMEOUT,
+                side_dir: Path | None = None) -> HarvestResult:
+    """Citations and bibliography entries as runs.
+
+    BibTeX documents are read from the existing ``.bbl`` with no compile. biblatex documents need the
+    harvest side compile: inside the OS sandbox when ``side_dir`` is None, otherwise the side document is
+    written to ``side_dir`` for the user to compile and the PDF they produced is used (see sidecompile)."""
+    if not pf.uses_biblatex and uses_bibtex(doc):
+        from .bbl import harvest_from_bbl
+
+        return harvest_from_bbl(pf, doc, audit)
     tex, bib_keys = build_harvest_tex(pf, doc)
-    pdf = compile_harvest(pf, tex, audit, timeout=timeout)
-    res = HarvestResult(tex=pf.workdir / "harvest.tex")
+    if side_dir is None:
+        pdf = compile_harvest(pf, tex, audit, timeout=timeout)
+        res = HarvestResult(tex=pf.workdir / "harvest.tex")
+    else:
+        from .sidecompile import user_compiled_pdf
+
+        pdf = user_compiled_pdf(pf, side_dir, "harvest", tex, audit, "harvest",
+                                bib="biber" if pf.uses_biblatex else "bibtex")
+        res = HarvestResult(tex=side_dir / "harvest.tex")
     if pdf is None:
         res.log_errors.append("compile failed")
         return res
     if not shutil.which("pdftotext"):
         audit.add("harvest", "pdftotext not found; citations rendered as [key]")
         return res
-    r = sandbox.run(["pdftotext", "-raw", str(pdf), "-"], cwd=pf.workdir, timeout=60, rw=[], ro=[pf.workdir])
+    r = sandbox.run(["pdftotext", "-raw", str(pdf), "-"], cwd=pf.workdir, timeout=60, rw=[], ro=[pdf.parent])
     if r.returncode != 0:
         audit.add("harvest", f"pdftotext failed: {r.stderr[:200]}; citations rendered as [key]")
         return res
