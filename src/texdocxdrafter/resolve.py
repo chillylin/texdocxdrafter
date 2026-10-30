@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from .audit import Audit
 from .auxreader import AuxLabel
 from .parser.model import (
-    Bibliography, DisplayMath, Document, Figure, Heading, Image, ListItem, Para, Ref, Table, walk_tree,
+    Bibliography, DisplayMath, Document, Figure, Heading, Image, Label, ListItem, Para, Ref, Table, walk_tree,
 )
 
 
@@ -37,6 +37,12 @@ def collect_labels(doc: Document, aux: dict[str, AuxLabel], audit: Audit) -> dic
         if kind == "para":
             labels[key].heading = last_heading[0]
 
+    def caption_labels(n, kind):
+        """``\\label`` written inside ``\\caption{...}`` stays a Label node in the caption: same kind as the float."""
+        for x in n.caption or []:
+            if isinstance(x, Label) and x.key not in labels:
+                add(x.key, kind, 0, n.loc)
+
     def visit(n):
         if isinstance(n, Heading):
             add(n.label, "section", n.level, n.loc)
@@ -44,10 +50,13 @@ def collect_labels(doc: Document, aux: dict[str, AuxLabel], audit: Audit) -> dic
                 last_heading[0] = n.label or ""
         elif isinstance(n, Table):
             add(n.label, "table", 0, n.loc)
+            caption_labels(n, "table")
         elif isinstance(n, Figure):
             add(n.label, "figure", 0, n.loc)
+            caption_labels(n, "figure")
         elif isinstance(n, Image):
             add(n.label, "subfigure", 0, n.loc)
+            caption_labels(n, "subfigure")
         elif isinstance(n, DisplayMath):
             for ln in n.lines:
                 add(ln.label, "equation", 0, ln.loc)

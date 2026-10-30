@@ -21,9 +21,14 @@ def q(tag: str) -> str:
 _XML_BAD = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 
+STRIPPED = [0]  # how many characters xml_safe dropped since the writer reset it (reported, not silent)
+
+
 def xml_safe(text: str) -> str:
     """``text`` without the characters lxml refuses (they come from pdftotext, .bbl files or the source)."""
-    return _XML_BAD.sub("", text)
+    out, n = _XML_BAD.subn("", text)
+    STRIPPED[0] += n
+    return out
 
 
 # the only targets a hyperlink may have, in the writer's own links and in those kept from a reference document

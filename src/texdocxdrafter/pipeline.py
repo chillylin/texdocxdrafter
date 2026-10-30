@@ -58,6 +58,10 @@ class SourceChangedError(PreflightError):
     """An input changed while the document was being converted; nothing was published."""
 
 
+class PublishError(RuntimeError):
+    """Publishing failed and the files already written could not all be put back: the message says which."""
+
+
 _LAYOUT = [
     re.compile(r"\\(?:multicolumn|multirow)\*?(?:\[[^\]]*\])?\{[^{}]*\}\{[^{}]*\}"),
     re.compile(r"\\cmidrule(?:\([^)]*\))?(?:\[[^\]]*\])?\{[^}]*\}"),
@@ -266,22 +270,41 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _write_tmp(path: Path, data: bytes) -> str:
+def _umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def _write_tmp(path: Path, data: bytes, mode: int | None = None) -> str:
+    """``data`` in an exclusively created temporary file beside ``path``, with ``mode`` (the mode of the file it
+    will replace) or, for a new file, the usual 0666 minus the umask: mkstemp's 0600 would hide the output from
+    coauthors in a shared folder."""
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(tmp, mode if mode is not None else 0o666 & ~_umask())
     except BaseException:
         os.unlink(tmp)
         raise
     return tmp
 
 
+def _mode_of(path: Path) -> int | None:
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    return stat.S_IMODE(st.st_mode) if stat.S_ISREG(st.st_mode) else None
+
+
 def write_atomic(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` through an exclusively created temporary file in the same directory."""
-    tmp = _write_tmp(path, data)
+    """Write ``data`` to ``path`` through an exclusively created temporary file in the same directory; an existing
+    file keeps its mode."""
+    tmp = _write_tmp(path, data, _mode_of(path))
     try:
         os.replace(tmp, path)
     except BaseException:
@@ -302,20 +325,31 @@ def commit_file(path: Path, data: bytes, snapshot: str | None, what: str = "file
     opened (never through a symbolic link), its content must still hash to ``snapshot``, and its identity
     (device, inode, size, times) is compared once more right before the rename. What remains is the gap
     between that comparison and the rename itself; a path-based replace cannot close it entirely."""
-    tmp = _write_tmp(path, data)
+    tmp = _write_tmp(path, data, _mode_of(path) if snapshot is not None else None)
     try:
         if snapshot is None:
+            appeared = PreflightError(f"{what} {path} appeared while the document was being converted; "
+                                      "not touching it (rerun to replace it if it is yours)")
             try:
                 os.link(tmp, path)  # fails with EEXIST if anything, even a symlink, appeared at the target
             except FileExistsError:
-                raise PreflightError(f"{what} {path} appeared while the document was being converted; "
-                                     "not touching it (rerun to replace it if it is yours)")
-            except OSError:  # hard links unsupported here: exclusive create, then write
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-                with os.fdopen(fd, "wb") as f:
-                    f.write(data)
+                raise appeared
+            except OSError:  # hard links unsupported (FAT, some shares): reserve the name exclusively, then rename
+                try:
+                    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+                except FileExistsError:
+                    raise appeared
+                try:
+                    os.replace(tmp, path)  # the data was written to tmp already: never a half-written target
+                    tmp = None
+                except BaseException:
+                    try:
+                        os.unlink(path)  # our empty reservation
+                    except OSError:
+                        pass
+                    raise
             _fsync_dir(path.parent)
-            return
+            return  # tmp is now a second name of the new target (or None): the finally removes it
         changed = PreflightError(f"{what} {path} was changed by something else while the document was being "
                                  "converted; not touching it (rerun to replace it if it is yours)")
         try:
@@ -362,15 +396,21 @@ def publish(items: list[tuple]) -> None:
             previous = path.read_bytes() if snapshot is not None else None
             commit_file(path, data, snapshot, what)
             done.append((path, previous))
-    except BaseException:
+    except BaseException as exc:
+        failed: list[str] = []
         for path, previous in reversed(done):
             try:
                 if previous is None:
                     os.unlink(path)
                 else:
                     write_atomic(path, previous)
-            except OSError:
-                pass
+            except OSError as e2:
+                failed.append(f"{path.name} ({e2.strerror or e2})")
+        if failed:
+            left = [p.name for p, _ in done]
+            raise PublishError(f"publishing failed ({exc}) and the files already written could not be put back: "
+                               f"{', '.join(failed)}. {', '.join(left)} now hold the new build while the rest do not; "
+                               "when the problem is fixed, rerun with --overwrite to bring them in line") from exc
         raise
 
 
@@ -450,6 +490,9 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
     reg = registry.data
     out = output_path(pf, out, overwrite, reg)
     report = vet_target(report_path(out), "report", pf, reg, overwrite)
+    if reference_doc and (Path(reference_doc).resolve() in (out.resolve(), report.resolve())
+                          or _samefile(Path(reference_doc), out)):
+        raise PreflightError(f"the output {out.name} is the reference document itself; choose another output path")
     # what the vetted targets look like now; the commit at the end refuses if anything changed them meanwhile
     snaps = {out: _snapshot(out), report: _snapshot(report)}
     for issue in pf.issues:

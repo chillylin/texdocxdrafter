@@ -380,6 +380,9 @@ class BlockMixin:
         return Image(name=f"tikz-{self.tikz_count}", tikz=src, loc=self.loc(n))
 
     def float_env(self, n) -> list:
+        """A table or figure environment. Every block it holds is kept: a float with several captions gives one
+        captioned block per caption (each caption with the content before it, or after it when nothing precedes),
+        and tabulars inside a figure (or pictures inside a table) follow the main block instead of vanishing."""
         name = n.environmentname
         kind = "table" if name in FLOATS_TABLE else "figure"
         acc = FloatAcc()
@@ -387,31 +390,60 @@ class BlockMixin:
         loc = self.loc(n)
         notes = [b for b in self.blocks(acc.rest) if isinstance(b, Para)]
         wide = name.endswith("*")
+        segments = acc.segments + [acc.segment()]
+        if len(segments) > 1:
+            self.audit.add(kind, f"{len(segments)} captions in one {name} environment: one captioned "
+                                 f"{kind} per caption", loc)
+        out: list = []
+        for i, seg in enumerate(segments):
+            out.extend(self._float_segment(kind, name, seg, notes if i == len(segments) - 1 else [], wide, loc))
+        return out
+
+    def _float_segment(self, kind: str, name: str, seg: "FloatSegment", notes: list, wide: bool, loc) -> list:
+        caption = seg.caption
+        if seg.extra_labels:  # a second \\label in the float: kept as a bookmark inside the caption text
+            caption = list(caption or []) + [Label(key=k, loc=loc) for k in seg.extra_labels]
+        tables, images = list(seg.tables), list(seg.images)
+        out: list = []
+        if kind == "table" and not tables and images:
+            self.audit.add("table", "table environment without a tabular: treated as a figure", loc)
+            kind = "figure"
+        elif kind == "figure" and tables and not images:
+            self.audit.add("table", "figure environment holds a tabular: kept as a table", loc)
+            kind = "table"
         if kind == "table":
-            if not acc.tables:
-                if acc.images:
-                    self.audit.add("table", "table environment without a tabular: treated as a figure", loc)
-                    return [Figure(images=acc.images, caption=acc.caption, short_caption=acc.short, label=acc.label,
-                                   notes=notes, loc=loc)]
+            if not tables:
+                if caption is None and not seg.label:
+                    return []
                 self.audit.add("table", "table environment without a tabular", loc)
-                return [Para(children=acc.caption or [Text(text="")], style="caption_table", loc=loc)]
-            first = acc.tables[0]
-            first.caption, first.short_caption, first.label = acc.caption, acc.short, acc.label
+                return [Para(children=caption or [Text(text="")], style="caption_table", loc=loc)]
+            first = tables[0]
+            first.caption, first.short_caption, first.label = caption, seg.short, seg.label
             first.notes = notes
             first.wide = wide
-            for t in acc.tables[1:]:
+            for t in tables[1:]:
                 t.floating = False
-            if len(acc.tables) > 1:
-                self.audit.add("table", f"{len(acc.tables)} tabulars in one table environment; "
+            if len(tables) > 1:
+                self.audit.add("table", f"{len(tables)} tabulars in one {name} environment; "
                                "caption attached to the first", loc)
-            return list(acc.tables)
-        if acc.tables and not acc.images:
-            self.audit.add("table", "figure environment holds a tabular: kept as a table", loc)
-            t = acc.tables[0]
-            t.caption, t.label, t.notes = acc.caption, acc.label, notes
-            return [t]
-        return [Figure(images=acc.images, caption=acc.caption, short_caption=acc.short, label=acc.label,
-                       notes=notes, wide=wide, loc=loc)]
+            out.extend(tables)
+            if images:
+                self.audit.add("figure", f"{len(images)} picture(s) inside a {name} environment kept after the table", loc)
+                out.append(Figure(images=images, floating=False, loc=loc))
+            return out
+        if not images and not tables:
+            if caption is None and not seg.label:
+                return []
+            return [Figure(images=[], caption=caption, short_caption=seg.short, label=seg.label, notes=notes,
+                           wide=wide, loc=loc)]
+        out.append(Figure(images=images, caption=caption, short_caption=seg.short, label=seg.label,
+                          notes=notes, wide=wide, loc=loc))
+        if tables:
+            self.audit.add("table", f"{len(tables)} tabular(s) inside a {name} environment kept after the figure", loc)
+            for t in tables:
+                t.floating = False
+            out.extend(tables)
+        return out
 
     def collect_float(self, nodes: list, acc: "FloatAcc") -> None:
         for n in nodes:
@@ -422,7 +454,10 @@ class BlockMixin:
                     if acc.sub is not None:
                         acc.sub.caption = self.caption_inlines(a[-1])
                     else:
+                        if acc.caption is not None:
+                            acc.new_caption()  # a second caption: the content so far gets its own block
                         acc.caption = self.caption_inlines(a[-1])
+                        acc.at_caption = (len(acc.tables), len(acc.images))
                         if len(a) > 1 and a[1] is not None and nm == "caption":
                             acc.short = self.caption_inlines(a[1])
                 elif nm == "subcaption" and a:
@@ -435,6 +470,8 @@ class BlockMixin:
                         acc.sub.label = key
                     elif acc.label is None:
                         acc.label = key
+                    elif key:
+                        acc.extra_labels.append(key)
                 elif nm == "includegraphics":
                     img = self.image(n)
                     acc.images.append(img)
@@ -486,8 +523,8 @@ class BlockMixin:
                 acc.rest.append(n)
 
     def caption_inlines(self, arg) -> list:
-        items = self.inlines(arg_nodes(arg))
-        return strip_inlines([x for x in items if not isinstance(x, Label)])
+        """The caption text; a \\label written inside the caption stays as a Label node (the writer bookmarks it)."""
+        return strip_inlines(self.inlines(arg_nodes(arg)))
 
     def table_notes(self, env) -> list:
         """tablenotes: each \\item becomes a note paragraph; returns synthetic nodes via a flag list."""
@@ -540,17 +577,45 @@ class _Marker(LatexMacroNode):
         self.inl = inl
 
 
+class FloatSegment:
+    """One captioned block of a float: its caption, labels and content."""
+
+    def __init__(self, caption, short, label, extra_labels, tables, images):
+        self.caption, self.short, self.label = caption, short, label
+        self.extra_labels, self.tables, self.images = extra_labels, tables, images
+
+
 class FloatAcc:
     def __init__(self):
         self.caption = None
         self.short = None
         self.label = None
+        self.extra_labels: list = []
         self.images: list = []
         self.tables: list = []
         self.rest: list = []
         self.sub = None
         self.pending_subcaption = None
         self.size = None  # last font-size declaration, applied to tikzpicture renders
+        self.segments: list = []  # finished FloatSegments (a float with several captions)
+        self.at_caption = (0, 0)  # how many tables and images had been seen when the current caption arrived
+
+    def segment(self) -> FloatSegment:
+        return FloatSegment(self.caption, self.short, self.label, self.extra_labels, self.tables, self.images)
+
+    def new_caption(self) -> None:
+        """A second \\caption: close the segment of the first. A caption that followed content owns that content;
+        one that preceded it owns what came after, up to here."""
+        nt, ni = self.at_caption
+        if nt + ni > 0:  # caption below its content: the content before it is its own, the rest moves on
+            self.segments.append(FloatSegment(self.caption, self.short, self.label, self.extra_labels,
+                                              self.tables[:nt], self.images[:ni]))
+            self.tables, self.images = self.tables[nt:], self.images[ni:]
+        else:  # caption above its content: everything so far is its own
+            self.segments.append(self.segment())
+            self.tables, self.images = [], []
+        self.caption = self.short = self.label = None
+        self.extra_labels = []
 
 
 LatexChars = LatexCharsNode

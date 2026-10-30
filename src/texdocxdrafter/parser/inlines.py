@@ -5,6 +5,7 @@ from ..lexer import (
     LatexCharsNode, LatexEnvironmentNode, LatexGroupNode, LatexMacroNode, LatexMathNode, LatexSpecialsNode,
     arg_nodes, arg_text, macro_args, plain_text,
 )
+from ..preflight import unescape_url
 from .core import (
     ACCENT_MACROS, CITE_CMDS, DECLARATIONS, DROP_MACROS, MACRO_TEXT, REF_CMDS, SPECIALS, STYLED, TRANSPARENT,
     merge_text, norm_text,
@@ -15,6 +16,12 @@ from .model import (
 
 
 MAX_DECLARATION_DEPTH = 50  # nested font declarations (\bfseries ...) in one inline run
+
+_BARE_ACCENT = {"^": "^", "~": "~", '"': "\u00a8", "'": "\u00b4", "`": "`", "=": "\u00af", ".": "\u02d9", "u": "\u02d8",
+                "v": "\u02c7", "H": "\u02dd", "c": "\u00b8", "d": ".", "b": "_", "r": "\u02da", "k": "\u02db", "t": "\u0361"}
+_SPACE_MACROS = {"hfill", "hspace", "hspace*", "hskip", "quad", "qquad", "enskip", "enspace", "thinspace", "negthinspace",
+                 "hfil", "hss", "dotfill", "hrulefill"}
+
 
 class InlineMixin:
     in_footnote: int = 0
@@ -136,12 +143,15 @@ class InlineMixin:
                 self.in_footnote -= 1
             out.append(Footnote(blocks=blocks, loc=loc))
             return
-        if name in ("url",):
-            u = arg_text(args[0]).strip() if args else ""
-            out.append(Link(url=u, children=[Text(text=u, loc=loc)], loc=loc))
+        if name in ("url", "nolinkurl", "path"):
+            u = unescape_url(arg_text(args[0]).strip()) if args else ""
+            if name == "url":
+                out.append(Link(url=u, children=[Text(text=u, loc=loc)], loc=loc))
+            else:
+                out.append(Styled(kind="code", children=[Text(text=u, loc=loc)], loc=loc))
             return
         if name == "href":
-            u = arg_text(args[0]).strip() if args else ""
+            u = unescape_url(arg_text(args[0]).strip()) if args else ""
             out.append(Link(url=u, children=self.inlines(arg_nodes(args[1])) if len(args) > 1 else [], loc=loc))
             return
         if name == "hyperref":
@@ -175,7 +185,13 @@ class InlineMixin:
             return
         if name in ACCENT_MACROS:
             t = self.accent_text(n)
+            if not t and not plain_text(arg_nodes(args[0]) if args and args[0] is not None else []).strip():
+                t = _BARE_ACCENT.get(name, "")  # \\^{} is a caret, \\~{} a tilde
             out.append(Text(text=t if t else "", loc=loc))
+            return
+        if name in _SPACE_MACROS:  # horizontal space: a\\hfill b must not read "ab"
+            self.drop(n)
+            out.append(Text(text=" ", loc=loc))
             return
         if name in DROP_MACROS or name in self.ex.mathops:
             self.drop(n)

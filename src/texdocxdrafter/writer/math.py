@@ -8,6 +8,8 @@ from lxml import etree
 from .xmlutil import M, NSMAP, W, el, q
 
 PLACEHOLDER = "\ue000"  # stands for an alignment point '&' while converting a line
+BINOM_MARK = "\ue002"  # marks the numerator of a \\binom so the OMML fraction can be made bar-less
+_UNKNOWN = re.compile(r"<mi>\\([A-Za-z]+)</mi>")  # a control sequence the converter did not know: kept as text
 
 _REPLACEMENTS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\\(?:mathbbm|mathds)\b"), r"\\mathbb"),
@@ -27,7 +29,9 @@ _REPLACEMENTS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\\(?:limits|nolimits)\b"), ""),
     (re.compile(r"\\boldsymbol\{\\(\w+)\}"), r"\\boldsymbol{\\\1}"),
     (re.compile(r"\\ensuremath\{([^{}]*)\}"), r"\1"),
-    (re.compile(r"\;|\\:|\\,|\\!|\\>"), " "),
+    (re.compile(r"\\;|\\:|\\,|\\!|\\>"), " "),  # the thin spaces, not a plain ; (p(y;\\mu) keeps its semicolon)
+    (re.compile(r"\\(?:dbinom|tbinom)\b"), r"\\binom"),
+    (re.compile(r"\\binom\{"), r"\\binom{" + BINOM_MARK),  # found again in the OMML: the fraction gets no bar
     (re.compile(r"\\lvert|\\rvert"), "|"),
     (re.compile(r"\\lVert|\\rVert"), "‖"),
     (re.compile(r"\\leqslant\b"), r"\\leq"),
@@ -77,8 +81,9 @@ def _fix_radicals(root) -> None:
             rad.insert(list(rad).index(rad.find(q("m:e"))), el("m:deg"))
 
 
-def convert(latex: str):
-    """Return an ``m:oMath`` element, or raise on failure."""
+def convert(latex: str, unknown: list | None = None):
+    """Return an ``m:oMath`` element, or raise on failure. Control sequences the converter does not know come out
+    as literal text; their names are appended to ``unknown`` when given, so the writer can report them."""
     import latex2mathml.converter as l2m
     import mathml2omml
 
@@ -88,6 +93,8 @@ def convert(latex: str):
     if not src:
         raise ValueError("empty formula")
     mathml = l2m.convert(src)
+    if unknown is not None:
+        unknown.extend(m.group(1) for m in _UNKNOWN.finditer(mathml))
     omml = mathml2omml.convert(mathml)
     # mathml2omml 0.0.2 leaves <m:groupChrPr> unclosed (accents, \\vec, \\underbrace)
     omml = re.sub(r"(<m:groupChrPr>(?:<m:(?:chr|pos|vertJc)[^>]*/>)*)</m:groupChr>", r"\1</m:groupChrPr>", omml)
@@ -97,7 +104,27 @@ def convert(latex: str):
         raise ValueError("no oMath in converter output")
     _unwrap_boxes(node)
     _fix_radicals(node)
+    _binomials(node)
     return node
+
+
+def _binomials(node) -> None:
+    """A fraction whose numerator starts with BINOM_MARK is a binomial coefficient: no bar."""
+    for t in list(node.iter(q("m:t"))):
+        if t.text and BINOM_MARK in t.text:
+            t.text = t.text.replace(BINOM_MARK, "")
+            frac = next((a for a in t.iterancestors() if a.tag == q("m:f")), None)
+            if frac is not None:
+                pr = frac.find(q("m:fPr"))
+                if pr is None:
+                    pr = el("m:fPr")
+                    frac.insert(0, pr)
+                if pr.find(q("m:type")) is None:
+                    pr.append(el("m:type", {"m:val": "noBar"}))
+            if not t.text:
+                r = t.getparent()
+                if r is not None and r.tag == q("m:r") and r.getparent() is not None and len(r.getparent()) > 1:
+                    r.getparent().remove(r)
 
 
 def omath_para(oMath) -> "etree._Element":
@@ -127,11 +154,11 @@ def _alignment_points(e) -> None:
             pr.append(el("m:aln"))
 
 
-def eq_array(lines: list[str]):
+def eq_array(lines: list[str], unknown: list | None = None):
     """Several aligned lines as one OMML equation array; '&' marks alignment points."""
     rows = []
     for ln in lines:
-        node = convert(ln.replace("&", PLACEHOLDER))
+        node = convert(ln.replace("&", PLACEHOLDER), unknown)
         e = el("m:e")
         for c in list(node):
             e.append(c)
@@ -140,5 +167,5 @@ def eq_array(lines: list[str]):
     return el("m:oMath", None, el("m:eqArr", None, *rows))
 
 
-def inline_math(latex: str):
-    return convert(latex.replace("&", " "))
+def inline_math(latex: str, unknown: list | None = None):
+    return convert(latex.replace("&", " "), unknown)

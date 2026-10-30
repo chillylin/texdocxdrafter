@@ -25,6 +25,7 @@ from ..refdoc import build_reference
 from . import images as gfx
 from . import math as omml
 from .textmath import text_math
+from . import xmlutil
 from .xmlutil import NSMAP, br, el, field, fld_char, instr, para, q, rpr, run, style_id
 from .xmlutil import safe_url, xml_safe
 
@@ -66,6 +67,9 @@ class DocxWriter:
         self._bm = 100
         self.seq = Counter()
         self.footnotes: list = []
+        self.fn_part = None  # the footnotes part, created with the first footnote: links and pictures inside a
+        self.fn_depth = 0    # footnote are related to it, not to the document part
+        self.unknown_math: Counter = Counter()  # control sequences the math converter kept as text
         self.used = Counter()
         self.last_was_table = False
         self.heading_count = Counter()
@@ -169,7 +173,17 @@ class DocxWriter:
             elif isinstance(x, Link):
                 out.extend(self.hyperlink(x, flags))
             elif isinstance(x, Footnote):
-                out.append(self.footnote_ref(x))
+                if self.fn_depth:  # Word has no footnotes inside footnotes: the inner one is written in parentheses
+                    self.audit.add("raw", "footnote inside a footnote written inline in parentheses", x.loc)
+                    out.append(run(" ("))
+                    for i, b in enumerate(x.blocks):
+                        if isinstance(b, Para):
+                            if i:
+                                out.append(run(" "))
+                            out.extend(self.inl(b.children, flags, link))
+                    out.append(run(")"))
+                else:
+                    out.append(self.footnote_ref(x))
             elif isinstance(x, Cite):
                 out.extend(self.cite_elements(x))
             elif isinstance(x, Ref):
@@ -198,8 +212,11 @@ class DocxWriter:
         runs = self.inl(link.children, flags, link=True)
         if not safe_url(link.url):
             self.audit.count("link with a non-web target kept as text")
+            self.audit.add("other", f"link target '{(link.url or '')[:80]}' is not a web or mail address: "
+                           "the text is kept, the link is not", link.loc)
             return runs
-        rid = self.d.part.relate_to(link.url, RT.HYPERLINK, is_external=True)
+        part = self.footnote_part() if self.fn_depth else self.d.part
+        rid = part.relate_to(link.url, RT.HYPERLINK, is_external=True)
         h = el("w:hyperlink", {"r:id": rid})
         for r in runs:
             h.append(r)
@@ -313,7 +330,9 @@ class DocxWriter:
                     out.append(self.text_run(text, flags))
             return out
         try:
-            node = omml.inline_math(m.latex)
+            unknown: list = []
+            node = omml.inline_math(m.latex, unknown)
+            self._note_unknown(unknown, m.loc)
             self.audit.count("inline math (OMML)")
             return [node]
         except Exception as exc:
@@ -329,15 +348,23 @@ class DocxWriter:
         ref.append(el("w:footnoteReference", {"w:id": fid}))
         return fn, ref
 
+    def footnote_part(self):
+        """The footnotes part, created on first use so that its relationships can be added while writing."""
+        if self.fn_part is None:
+            self.fn_part = Part(PackURI("/word/footnotes.xml"), CT.WML_FOOTNOTES, b"", self.d.part.package)
+        return self.fn_part
+
     def footnote_ref(self, f: Footnote):
         fn, ref = self.new_footnote()
         saved = (self.container, self.override)
         self.container, self.override = fn, "footnote"
+        self.fn_depth += 1
         try:
             for b in f.blocks:
                 self.write_block(b)
         finally:
             self.container, self.override = saved
+            self.fn_depth -= 1
         self._prefix_footnote(fn)
         if self.rev_stack:
             self.mark_inside(fn, self.rev_stack[-1], marks=True)
@@ -374,7 +401,8 @@ class DocxWriter:
         for fn in self.footnotes:
             root.append(fn)
         blob = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-        part = Part(PackURI("/word/footnotes.xml"), CT.WML_FOOTNOTES, blob, self.d.part.package)
+        part = self.footnote_part()
+        part._blob = blob
         self.d.part.relate_to(part, RT.FOOTNOTES)
         settings = self.d.settings.element
         fp = el("w:footnotePr", None, el("w:footnote", {"w:id": -1}), el("w:footnote", {"w:id": 0}))
@@ -668,36 +696,42 @@ class DocxWriter:
         if has_cap and pos == "above":
             self.caption("figure", f.caption, f.label, f.loc)
         multi = len(f.images) > 1
-        for img in f.images:
-            self.write_image(img)
-            if multi and img.caption:
-                self.add(para(self.ps("figure_note"), [run("(" + _panel(f.images.index(img)) + ") ")] +
+        for i, img in enumerate(f.images):
+            p = self.write_image(img)
+            if img.label and p is not None:  # \\label inside a subfigure: a bookmark in the picture paragraph
+                for e in self.bookmark(self.label_bm(img.label), []):
+                    p.append(e)
+            if img.caption:
+                self.add(para(self.ps("figure_note"), ([run("(" + _panel(i) + ") ")] if multi else []) +
                               self.inl(img.caption)))
         if has_cap and pos == "below":
             self.caption("figure", f.caption, f.label, f.loc)
         if f.notes:
             self.write_notes(f.notes, "figure_note")
 
-    def write_image(self, img) -> None:
+    def write_image(self, img):
+        """Write the picture (or its placeholder) and return the paragraph holding it."""
         if img.tikz is not None:
             if img.path is None:
                 self.audit.add("raw", "tikzpicture not rendered: kept as visible text", img.loc)
-                self.add(para(self.ps("body"), [run(img.tikz, self.cs("todo"))]))
-                return
-            self.add_picture(Path(img.path), img.width_in)
-            return
+                p = para(self.ps("body"), [run(img.tikz, self.cs("todo"))])
+                self.add(p)
+                return p
+            return self.add_picture(Path(img.path), img.width_in)
         path = gfx.find_graphic(img.name, self.pf.srcdir, self.pf.graphicspath,
                                 [self.pf.srcdir] + list(self.pf.allow_dirs))
         if path is None:
             self.audit.add("figure", f"graphic '{img.name}' not found", img.loc)
-            self.add(para(self.ps("figure"), [run(f"[missing figure: {img.name}]", self.cs("todo"))]))
-            return
+            p = para(self.ps("figure"), [run(f"[missing figure: {img.name}]", self.cs("todo"))])
+            self.add(p)
+            return p
         fingerprint(self.pf, path)  # the build refuses to publish if the file changes before the end
         ras = gfx.to_raster(path, self.pf.workdir / "images")
         if ras is None:
             self.audit.add("figure", f"graphic '{path.name}' could not be converted", img.loc)
-            self.add(para(self.ps("figure"), [run(f"[figure not converted: {path.name}]", self.cs("todo"))]))
-            return
+            p = para(self.ps("figure"), [run(f"[figure not converted: {path.name}]", self.cs("todo"))])
+            self.add(p)
+            return p
         from docx.image.image import Image as DImage
 
         try:
@@ -709,17 +743,31 @@ class DocxWriter:
         w_in = gfx.width_inches(img.options, natural, avail)
         if w_in is None:
             w_in = min(natural or avail, avail)
-        self.add_picture(ras, w_in)
+        return self.add_picture(ras, w_in)
 
-    def add_picture(self, ras: Path, w_in: float | None) -> None:
+    def add_picture(self, ras: Path, w_in: float | None):
         avail = self.text_width_twips() / 1440
         w_in = min(w_in or avail, avail)
         from docx.oxml import parse_xml
 
         p = parse_xml(etree.tostring(para(self.ps("figure"))))
         self.add(p)
-        Paragraph(p, self.d._body).add_run().add_picture(str(ras), width=Inches(w_in))
+        if self.fn_depth:  # inside a footnote: the image relationship belongs to the footnotes part
+            from docx.oxml.shape import CT_Inline
+
+            image_part = self.d.part.package.get_or_add_image_part(str(ras))
+            rid = self.footnote_part().relate_to(image_part, RT.IMAGE)
+            cx, cy = image_part.image.scaled_dimensions(Inches(w_in), None)
+            inline = CT_Inline.new_pic_inline(self.d.part.next_id, rid, image_part.filename, cx, cy)
+            r = el("w:r")
+            drawing = el("w:drawing")
+            drawing.append(inline)
+            r.append(drawing)
+            p.append(r)
+        else:
+            Paragraph(p, self.d._body).add_run().add_picture(str(ras), width=Inches(w_in))
         self.audit.count("figures embedded")
+        return p
 
     # ---- columns -----------------------------------------------------------------------------
     FRONT_STYLES = ("title", "author", "date", "keywords")
@@ -921,17 +969,35 @@ class DocxWriter:
         lines = m.lines
         if not lines:
             return
+        groups = _split_intertext(lines)
+        if len(groups) > 1 or groups[0][0] is not None:
+            self.audit.count("\\intertext")
+            for text, part in groups:
+                if text is not None:
+                    self.add(para(self.ps("body"), [run(text)]))
+                if part:
+                    self.write_display(DisplayMath(env=m.env, lines=part, latex=m.latex, loc=m.loc))
+            return
         if not any(l.numbered for l in lines):
+            labels = [l.label for l in lines if l.label]
             if len(lines) > 1:
                 try:
-                    node = omml.eq_array([l.latex for l in lines])
-                    self.add(para(self.ps("equation"), [omml.omath_para(node)]))
+                    unknown: list = []
+                    node = omml.eq_array([l.latex for l in lines], unknown)
+                    self._note_unknown(unknown, m.loc)
+                    kids: list = [omml.omath_para(node)]
+                    for lab in labels:  # \\label in an unnumbered display: its bookmark is the whole array
+                        kids = self.bookmark(self.label_bm(lab), kids)
+                    self.add(para(self.ps("equation"), kids))
                     self.audit.count("display math (OMML)")
                     return
                 except Exception as exc:
                     self.audit.add("math", f"{m.env}: {str(exc)[:60]}; lines converted separately", m.loc, "info")
             for l in lines:
-                self.add(para(self.ps("equation"), self.display_runs(l, m)))
+                kids = self.display_runs(l, m)
+                if l.label:  # \\[ ... \\label{} \\] : no number, but a \\ref must still find its target
+                    kids = self.bookmark(self.label_bm(l.label), kids)
+                self.add(para(self.ps("equation"), kids))
             return
         # numbered: borderless layout table, one row per line
         tbl = self.d.add_table(rows=len(lines), cols=3)
@@ -973,9 +1039,18 @@ class DocxWriter:
                 cells[2].append(para(self.ps("equation_number")))
         self.audit.count("numbered equations")
 
+    def _note_unknown(self, names: list, loc) -> None:
+        for nm in names:
+            if not self.unknown_math[nm]:
+                self.audit.add("math", f"\\{nm} is not known to the math converter: kept as the literal text "
+                               f"'\\{nm}' in the formula", loc)
+            self.unknown_math[nm] += 1
+
     def display_runs(self, line, m: DisplayMath) -> list:
         try:
-            node = omml.convert(line.latex.replace("&", " "))
+            unknown: list = []
+            node = omml.convert(line.latex.replace("&", " "), unknown)
+            self._note_unknown(unknown, line.loc or m.loc)
             self.audit.count("display math (OMML)")
             return [omml.omath_para(node)]
         except Exception as exc:
@@ -1019,6 +1094,7 @@ class DocxWriter:
         sec.left_margin = sec.right_margin = sec.top_margin = sec.bottom_margin = Inches(1)
 
     def write(self, out, comments: bool = True):
+        xmlutil.STRIPPED[0] = 0
         self.page_setup()
         anchors = []  # (block loc, first paragraph written for the block)
         for k, b in enumerate(self.doc.blocks):
@@ -1042,7 +1118,11 @@ class DocxWriter:
                 self.no_column_balance()
         if comments:
             self.write_comments(anchors)
+        self.defuse_dangling_refs()
         self.finish_footnotes()
+        if xmlutil.STRIPPED[0]:
+            self.audit.add("other", f"{xmlutil.STRIPPED[0]} control character(s) that XML cannot carry were dropped "
+                           "from the text", severity="info")
         self.nm.apply(self.d.part.numbering_part.element)
         settings = self.d.settings.element
         _insert_settings(settings, el("w:updateFields", {"w:val": "true"}), after=("w:zoom", "w:removePersonalInformation"))
@@ -1057,9 +1137,73 @@ class DocxWriter:
         self.audit.info["styles used"] = len(self.used)
         return out
 
+    def defuse_dangling_refs(self) -> None:
+        """A REF or PAGEREF field whose bookmark was never written would make Word complain and the validator
+        fail: keep its cached text, drop the field, and say so in the report."""
+        names = {b.get(q("w:name")) for b in self.body.iter(q("w:bookmarkStart"))}
+        for fn in self.footnotes:
+            names.update(b.get(q("w:name")) for b in fn.iter(q("w:bookmarkStart")))
+        roots = [self.body] + self.footnotes
+        for root in roots:
+            open_runs: list = []
+            doomed: list = []
+            target = None
+            for r in list(root.iter(q("w:r"))):
+                kinds = [c.get(q("w:fldCharType")) for c in r.findall(q("w:fldChar"))]
+                if "begin" in kinds:
+                    open_runs, target = [r], None
+                    continue
+                if not open_runs:
+                    continue
+                it = r.find(q("w:instrText"))
+                if it is not None:
+                    m = re.match(r"\s*(?:REF|PAGEREF)\s+(\S+)", it.text or "")
+                    if m:
+                        target = m.group(1)
+                    open_runs.append(r)
+                elif "separate" in kinds:
+                    open_runs.append(r)
+                elif "end" in kinds:
+                    if target is not None and target not in names:
+                        doomed.extend(open_runs + [r])
+                        self.audit.add("label", f"cross-reference to '{target}' has no target in the docx: shown as "
+                                       "plain text (the label sits where the writer makes no bookmark)")
+                    open_runs, target = [], None
+                else:
+                    pass  # the cached result run: kept
+            for r in doomed:
+                if r.getparent() is not None:
+                    r.getparent().remove(r)
+
+
 
 def _panel(i: int) -> str:
     return chr(ord("a") + i)
+
+
+def _split_intertext(lines: list) -> list:
+    """Split equation lines at ``\\intertext{...}``: [(text or None, [lines])...]; a single group with no text means
+    there was no \\intertext at all."""
+    groups: list = [(None, [])]
+    found = False
+    for l in lines:
+        m = re.match(r"\s*\\intertext\s*\{", l.latex)
+        if not m:
+            groups[-1][1].append(l)
+            continue
+        found = True
+        depth, j = 1, m.end()
+        while j < len(l.latex) and depth:
+            depth += {"{": 1, "}": -1}.get(l.latex[j], 0)
+            j += 1
+        text = re.sub(r"\\[A-Za-z]+\s*|[{}]", "", l.latex[m.end():j - 1]).strip()
+        rest = l.latex[j:].strip()
+        groups.append((text, []))
+        if rest:
+            groups[-1][1].append(type(l)(latex=rest, numbered=l.numbered, label=l.label, loc=l.loc))
+    if not found:
+        return groups
+    return [(t, ls) for t, ls in groups if t is not None or ls]
 
 
 def _plain(b) -> str:

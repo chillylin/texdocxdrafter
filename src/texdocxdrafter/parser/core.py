@@ -211,9 +211,10 @@ class ParserBase:
             return [node]
         site = self.loc(node)
         self.audit.count(f"{node.environmentname} (author environment)")
-        begin = self._tag(self.ex.walk(pair[0]), site)
-        end = self._tag(self.ex.walk(pair[1]), site)
-        return self.prep(begin + list(node.nodelist) + end, depth + 1)
+        # re-lex begin + body + end as one text: a \\begin{tabular} in the begin code and its \\end in the end
+        # code only form an environment when the lexer sees them together
+        inner = "".join(c.latex_verbatim() for c in node.nodelist)
+        return self.prep(self._tag(self.ex.walk(pair[0] + inner + pair[1]), site), depth + 1)
 
     def leftover_author_construct(self, name) -> bool:
         """An author macro or environment left unexpanded because the budget or the depth limit stopped it."""

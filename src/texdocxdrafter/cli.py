@@ -20,7 +20,7 @@ def _preflight(args, need_build_files=True):
 
 
 def cmd_build(args) -> int:
-    from .pipeline import OutputValidationError, build
+    from .pipeline import OutputValidationError, PublishError, build
     from .preflight import PreflightError
     from .refdoc import TemplateError
     from .stylemap import StyleMapError
@@ -34,7 +34,7 @@ def cmd_build(args) -> int:
     except (PreflightError, TemplateError, StyleMapError) as exc:
         print(f"texdocxdrafter: {exc}", file=sys.stderr)
         return 2
-    except OutputValidationError as exc:
+    except (OutputValidationError, PublishError) as exc:
         print(f"texdocxdrafter: {exc}", file=sys.stderr)
         return 1
     warn = len(res.audit.warnings())

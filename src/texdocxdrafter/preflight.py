@@ -113,26 +113,72 @@ def _neighbour_has_text(lines: list[str], i: int, step: int) -> bool:
     return 0 <= j < len(lines) and bool(lines[j].strip()) and not _BLOCK_LINE.match(lines[j])
 
 
+_URL_MACROS = ("url", "href", "path", "nolinkurl")
+
+
 def _strip_comment(line: str) -> tuple[str, bool]:
-    """Return (text before an unescaped %, whether a comment was found)."""
+    """Return (text before an unescaped %, whether a comment was found).
+
+    A % inside ``\\verb<d>...<d>`` or inside the argument of ``\\url``, ``\\href`` (first argument), ``\\path``
+    and ``\\nolinkurl`` is part of the text, not a comment: ``\\url{a%20b}`` must not swallow the line. Inside
+    those url arguments the % is written ``\\%`` in the returned text, so that the lexer (which also reads % as
+    a comment) keeps the group closed; the url handlers turn it back (``unescape_url``)."""
     i = 0
     n = len(line)
+    out: list[str] = []
     while i < n:
         c = line[i]
         if c == "\\":
+            m = re.compile(r"\\(verb\*?|%s)(?![A-Za-z])" % "|".join(_URL_MACROS)).match(line, i)
+            if m:
+                j = m.end()
+                if m.group(1).startswith("verb"):
+                    if j < n:
+                        close = line.find(line[j], j + 1)
+                        stop = n if close < 0 else close + 1
+                        out.append(line[i:stop])
+                        i = stop
+                        continue
+                else:
+                    while j < n and line[j] in " \t":
+                        j += 1
+                    if j < n and line[j] == "{":
+                        depth = 0
+                        k = j
+                        while k < n:
+                            if line[k] == "{":
+                                depth += 1
+                            elif line[k] == "}":
+                                depth -= 1
+                                if depth == 0:
+                                    break
+                            k += 1
+                        out.append(line[i:j] + line[j:k + 1].replace("%", "\\%"))
+                        i = k + 1
+                        continue
+            out.append(line[i:i + 2])
             i += 2
             continue
         if c == "%":
-            return line[:i], True
+            return "".join(out), True
+        out.append(c)
         i += 1
-    return line, False
+    return "".join(out), False
 
 
-def read_source_text(path: Path, issues: list[str], shown: str | None = None) -> str:
+def unescape_url(u: str) -> str:
+    """The url text as written: ``_strip_comment`` protected its % signs as ``\\%``."""
+    return u.replace("\\%", "%")
+
+
+def read_source_text(path: Path, issues: list[str], shown: str | None = None, fingerprints: dict | None = None) -> str:
     """A user-authored file (.tex, .bbl, .aux) as text. UTF-8 is required; bytes that are not UTF-8 are replaced
     by U+FFFD and reported in ``issues`` with the file and the offset of the first one, so the loss is never
-    silent (the bytes on disk are of course untouched)."""
+    silent (the bytes on disk are of course untouched). With ``fingerprints`` the sha256 of the bytes actually
+    read is recorded, so an edit made right after the read is caught by ``changed_inputs``."""
     data = path.read_bytes()
+    if fingerprints is not None:
+        fingerprints.setdefault(str(path), hashlib.sha256(data).hexdigest())
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -248,7 +294,8 @@ MAX_INPUT_CHARS = 50_000_000  # characters of included text per document
 
 def _flatten_file(path: Path, srcdir: Path, stack: tuple[Path, ...], issues: list[str],
                   comments: list[TexComment] | None = None,
-                  roots: list[Path] | None = None, budget: dict | None = None) -> list[tuple[str, str, int]]:
+                  roots: list[Path] | None = None, budget: dict | None = None,
+                  fingerprints: dict | None = None) -> list[tuple[str, str, int]]:
     """Return pieces (text, file, line) for one file with \\input expanded and comments removed.
 
     Removed comments are appended to ``comments``, except inside environments drawn as pictures. The
@@ -259,7 +306,7 @@ def _flatten_file(path: Path, srcdir: Path, stack: tuple[Path, ...], issues: lis
     if budget is None:
         budget = {"files": 0, "chars": 0, "noted": False}
     try:
-        text_all = read_source_text(path, issues, shown)
+        text_all = read_source_text(path, issues, shown, fingerprints)
     except OSError as exc:
         issues.append(f"cannot read {path}: {exc}")
         return pieces
@@ -332,7 +379,7 @@ def _flatten_file(path: Path, srcdir: Path, stack: tuple[Path, ...], issues: lis
                 continue
             if im.start() > pos:
                 pieces.append((text[pos:im.start()], shown, lineno))
-            pieces.extend(_flatten_file(target, srcdir, stack + (target,), issues, comments, roots, budget))
+            pieces.extend(_flatten_file(target, srcdir, stack + (target,), issues, comments, roots, budget, fingerprints))
             pos = im.end()
         pieces.append((text[pos:], shown, lineno))
     return pieces
@@ -412,7 +459,8 @@ def preflight(main: str | Path, need_build_files: bool = True, allow_dirs=()) ->
     roots = [srcdir] + allowed
     issues: list[str] = []
     comments: list[TexComment] = []
-    pieces = _flatten_file(main, srcdir, (main,), issues, comments, roots)
+    read_fps: dict[str, str] = {}  # sha256 of the bytes each source file gave us, taken as they were read
+    pieces = _flatten_file(main, srcdir, (main,), issues, comments, roots, fingerprints=read_fps)
     text = "".join(p[0] for p in pieces)
     starts: list[int] = []
     origins: list[tuple[str, int]] = []
@@ -482,6 +530,7 @@ def preflight(main: str | Path, need_build_files: bool = True, allow_dirs=()) ->
         if pf.uses_biblatex and not pf.bbl.is_file():
             raise PreflightError(f"{pf.bbl.name} is missing: run biber on {main.name} first")
     # what every input looks like now; the build refuses to publish if any of them changes meanwhile
+    pf.fingerprints.update(read_fps)
     for f in [main] + [srcdir / f for f, _ in source.origins] + [pf.aux, pf.bbl, pf.bcf]:
         if f.is_file():
             fingerprint(pf, f)

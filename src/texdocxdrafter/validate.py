@@ -76,7 +76,7 @@ def check_policy(z: zipfile.ZipFile, trees: dict, res: CheckResult) -> None:
             code: list[str] = []
             for r in tree.iter(w("r")):
                 kinds = [c.get(w("fldCharType")) for c in r.findall(w("fldChar"))]
-                code.extend(t.text or "" for t in r.findall(w("instrText")))
+                code.extend(t.text or "" for t in r.findall(w("instrText")) + r.findall(w("delInstrText")))
                 if "separate" in kinds or "end" in kinds:
                     instr = "".join(code).strip()
                     code = []
@@ -105,14 +105,17 @@ def check_docx(path) -> CheckResult:
     check_policy(z, trees, res)
     style_ids = {s.get(w("styleId")): (s.get(w("type")), (s.find(w("name")).get(w("val")) if s.find(w("name")) is not None else ""))
                  for s in styles.findall(w("style"))}
-    # relationships
-    rels = trees.get("word/_rels/document.xml.rels")
-    rel_ids = {r.get("Id") for r in rels} if rels is not None else set()
-    for el in doc.iter():
-        for attr in ("id", "embed", "link"):
-            v = el.get("{%s}%s" % (R, attr))
-            if v and v not in rel_ids:
-                res.errors.append(f"unresolved relationship {v}")
+    # relationships: every part resolves its r:ids against its own .rels (footnotes and headers have their own)
+    for name, tree in trees.items():
+        if not (name.startswith("word/") and name.endswith(".xml")):
+            continue
+        rels = trees.get("word/_rels/" + name[len("word/"):] + ".rels")
+        rel_ids = {r.get("Id") for r in rels} if rels is not None else set()
+        for el in tree.iter():
+            for attr in ("id", "embed", "link"):
+                v = el.get("{%s}%s" % (R, attr))
+                if v and v not in rel_ids:
+                    res.errors.append(f"{name}: unresolved relationship {v}")
     for name, tree in trees.items():
         if name.startswith("word/") and name.endswith(".xml") and name != "word/styles.xml":
             for el in tree.iter(w("pStyle"), w("rStyle"), w("tblStyle")):
@@ -139,7 +142,7 @@ def check_docx(path) -> CheckResult:
             extra = [c for c in rp if c.tag != w("rStyle")]
             if extra and not (r.find(w("fldChar")) is not None or r.find(w("instrText")) is not None):
                 res.direct_format_runs += 1
-        for it in root.iter(w("instrText")):
+        for it in root.iter(w("instrText"), w("delInstrText")):
             code = (it.text or "").strip()
             kind = code.split(" ")[0] if code else ""
             res.fields[kind] += 1

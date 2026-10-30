@@ -117,10 +117,10 @@ def test_failure_while_publishing_puts_everything_back(tmp_path, monkeypatch, fa
     registry_before = (tmp_path / "main.texdocxdrafter" / "outputs.json").read_bytes()
     real = pipeline._write_tmp
 
-    def failing(path, data):
+    def failing(path, data, mode=None):
         if fail_on in path.name:
             raise OSError(errno.ENOSPC, "No space left on device")
-        return real(path, data)
+        return real(path, data, mode)
 
     monkeypatch.setattr(pipeline, "_write_tmp", failing)
     with pytest.raises(OSError):

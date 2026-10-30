@@ -91,6 +91,8 @@ class TableMixin:
         header_end_marker: int | None = None
         pending_rule = False
         dropped_rows: set[int] = set()
+        lastfoot_rows: set[int] = set()
+        marker_pos = 0
 
         def finish_row(force: bool = False) -> None:
             nonlocal cells, pending_rule
@@ -119,19 +121,20 @@ class TableMixin:
                 else:
                     self.audit.add("table", f"\\{x.macroname} in the middle of a row ignored", self.loc(x))
             elif isinstance(x, LatexMacroNode) and x.macroname in LONGTABLE_MARKERS:
+                block = range(marker_pos, len(rows_nodes))  # the rows since the previous marker
                 if x.macroname == "endfirsthead":
                     header_end_marker = len(rows_nodes)
                 elif x.macroname == "endhead" and header_end_marker is not None:
-                    for k in range(header_end_marker, len(rows_nodes)):
-                        dropped_rows.add(k)
+                    dropped_rows.update(block)  # the repeated head: the first head is already there
                 elif x.macroname == "endhead":
                     header_end_marker = len(rows_nodes)
-                elif x.macroname in ("endfoot", "endlastfoot"):
-                    start = max(header_end_marker or 0, 0)
-                    # rows between the last head marker and here are footers: drop them
-                    for k in range(start, len(rows_nodes)):
-                        if k not in dropped_rows and x.macroname == "endfoot":
-                            dropped_rows.add(k)
+                elif x.macroname == "endfoot":  # the footer repeated on every page ("continued"): no page in Word
+                    dropped_rows.update(block)
+                    if any(not self._blank_row(rows_nodes[k]) for k in block):
+                        self.audit.add("table", "longtable per-page footer (\\endfoot) dropped", self.loc(x))
+                elif x.macroname == "endlastfoot":  # the closing rows: they belong after the body
+                    lastfoot_rows.update(block)
+                marker_pos = len(rows_nodes)
                 cells = [[]]
             else:
                 cells[-1].append(x)
@@ -151,6 +154,8 @@ class TableMixin:
                         c.remove(x)
         keep = [k for k, r in enumerate(rows_nodes)
                 if k not in dropped_rows and not all(self._blank(c) for c in r)]
+        if lastfoot_rows:  # \\endlastfoot rows are written in the source before the body: move them to the end
+            keep = [k for k in keep if k not in lastfoot_rows] + [k for k in keep if k in lastfoot_rows]
         if header_end_marker is not None and name == "longtable":
             hdr = header_end_marker
         else:
@@ -177,6 +182,9 @@ class TableMixin:
                     if cell.rowspan > 1:
                         for cc in range(col, col + cell.colspan):
                             occupied[cc] = cell.rowspan - 1
+                    up = getattr(cell, "_rowspan_up", 0)
+                    if up > 1:  # \\multirow{-n}: the merge covers this row and the n-1 rows above it
+                        self._merge_upwards(table.rows, row, cell, col, up)
                 row.cells.append(cell)
                 col += cell.colspan
             table.rows.append(row)
@@ -218,12 +226,45 @@ class TableMixin:
         if len(content) == 1 and isinstance(content[0], LatexMacroNode) and content[0].macroname == "multirow":
             a = macro_args(content[0])
             try:
-                cell.rowspan = max(1, int(plain_text(arg_nodes(a[1])).strip()))
+                n_rows = int(plain_text(arg_nodes(a[1])).strip())
             except ValueError:
-                cell.rowspan = 1
+                n_rows = 1
+            cell.rowspan = max(1, n_rows)
+            if n_rows < -1:
+                cell._rowspan_up = -n_rows  # placed by the row loop, which knows the rows above
             content = self.prep(arg_nodes(a[3]))
             self.audit.count("\\multirow")
         return cell, content
+
+    @staticmethod
+    def _merge_upwards(rows: list, row, cell, col: int, n: int) -> None:
+        """``\\multirow{-n}``: the text sits in the last row of a span that starts n-1 rows above. Give the span
+        to the top cell and make this one (and those between) continuations."""
+        above = rows[-(n - 1):] if len(rows) >= n - 1 else rows[:]
+        if not above:
+            return
+
+        def cell_at(r, c):
+            k = 0
+            for x in r.cells:
+                if k <= c < k + x.colspan:
+                    return x
+                k += x.colspan
+            return None
+
+        top = cell_at(above[0], col)
+        if top is None or top.vmerge:
+            return
+        top.rowspan = len(above) + 1
+        top.blocks = cell.blocks
+        for r in above[1:]:
+            mid = cell_at(r, col)
+            if mid is not None:
+                mid.vmerge = True
+                mid.blocks = []
+        cell.vmerge = True
+        cell.rowspan = 1
+        cell.blocks = []
 
     def cell_blocks(self, nodes: list, header: bool) -> list:
         blocks = self.blocks(nodes)

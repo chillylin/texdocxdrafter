@@ -326,14 +326,20 @@ reads only regular files there, never through a symbolic link, and creates its o
   written through an exclusively created temporary file and renamed into place, and the target is checked
   again at that moment: a file that appeared or changed while the conversion ran is left alone. The report,
   the docx and the registry are committed as one step, in that order; if one of the three fails (disk full,
-  permissions), the ones already written are put back to their previous content. What a sequence of renames
+  permissions), the ones already written are put back to their previous content, and if that fails as well the
+  run ends with a message naming the files that now disagree and asking for `--overwrite` on the next run. A
+  new file gets the usual permissions (0666 minus your umask) and a replaced file keeps its mode. On drives
+  without hard links (FAT, some network shares) the name is reserved by exclusive creation and the finished
+  temporary file renamed onto it, so a disk-full error never leaves a truncated output. The output may not be
+  the reference document. What a sequence of renames
   cannot promise: a crash between two of the three leaves them inconsistent (the next run will say so), the
   moment between the last identity check of the target and its rename remains open to a concurrent save by
   another program, and the directory is `fsync`ed after the rename only where the platform allows it, so
   durability across a power loss is best effort. A file at the
   registry's path that is not a registry this tool wrote, or that is one of your sources, stops the run.
 - Source files must be UTF-8. Bytes that are not are replaced by U+FFFD and the report names the file and the
-  offset of the first one; the files themselves are never modified.
+  offset of the first one; the files themselves are never modified. A `%` inside `\verb`, `\url`, `\href` or
+  `\path` is text, not a comment.
 - A reference document is used for its styles, numbering, page setup, headers and footers only. Its comments
   and people list, footnotes and endnotes, glossary, custom XML, custom and extended properties, thumbnail,
   every core property, attached-template path and document variables are removed first, so nothing of the
@@ -386,7 +392,14 @@ contents of table cells, citations (the harvest line gives their count), metadat
 - `\numberwithin` (per-section equation numbers) is not reproduced; Word numbers continuously.
 - A multi-line numbered `align` loses its alignment points (each numbered line is its own row);
   unnumbered `align*` keeps them.
-- Math conversion uses `latex2mathml` and `mathml2omml`; unusual formulas fall back to LaTeX text.
+- Math conversion uses `latex2mathml` and `mathml2omml`; unusual formulas fall back to LaTeX text, and a
+  macro the converter does not know stays in the formula as its literal name (reported). `\intertext` becomes
+  a body paragraph between two equation blocks.
+- Word has no footnotes inside footnotes: an inner footnote is written in parentheses inside the outer one
+  (reported). A `longtable` footer repeated on every page (`\endfoot`) is dropped (reported); the closing rows
+  (`\endlastfoot`) follow the body.
+- A float with several `\caption`s gives one captioned table or figure per caption; tabulars inside a figure
+  (or pictures inside a table) follow the main block.
 - Verify the result in Word at least once per document: open it, update fields, and insert a section
   to confirm renumbering.
 
