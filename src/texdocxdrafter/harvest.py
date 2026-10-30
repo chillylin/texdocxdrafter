@@ -66,12 +66,6 @@ class HarvestResult:
     tex: Path | None = None
 
 
-def foot_to_plain(raw: str) -> str:
-    """\\footcite becomes \\cite for the harvest (the tree records the footnote position)."""
-    return re.sub(r"^\\foot(cites?|citetext)\b", lambda m: "\\" + ("cites" if m.group(1) == "cites" else "cite"), raw) \
-        .replace("\\footfullcite", "\\fullcite")
-
-
 def option_string(opts: dict) -> str:
     parts = []
     for k, v in opts.items():
@@ -123,7 +117,7 @@ def build_harvest_tex(pf: Preflight, doc: Document, nonce: str = "") -> tuple[st
         if s > 0:
             out.append("\\begin{refsection}")
         for c in (c for c in cites if c.section == s):
-            raw = foot_to_plain(c.raw)
+            raw = c.raw  # \\footcite stays one: biblatex tracks repeats of text and footnote citations apart
             # \\relax ends the argument list of biblatex's \\cites, \\parencites, ...: without it the marker group
             # that follows would be read as one more citation
             out.append("{\\ttfamily @@CITE %d@@} %s\\relax{\\ttfamily @@END@@}\\par" % (c.index, raw))
@@ -297,10 +291,12 @@ def parse_text(text: str, expected_cites: int, bib_keys: list[tuple[int, int]], 
         # labels (e.g. "[1]", "[Knu84]", "12.") print before the entry marker, so the first one is in the lead
         # chunk and every other one trails the previous entry: move them back
         lm = _LABEL_AT_END.search(lead) if lead else None
+        form = None
         if lm and entries:
             k, rs = entries[0]
             entries[0] = (k, [Run(lm.group(1) + " ", frozenset())] + rs)
-        res.bibs[key] = _attach_labels(entries)
+            form = _label_form(lm.group(1))
+        res.bibs[key] = _attach_labels(entries, form)
     missing = [i for i in range(expected_cites) if i not in res.cites]
     if missing:
         audit.add("harvest", f"{len(missing)} citation(s) missing from the harvest output: {missing[:10]}")
@@ -316,9 +312,21 @@ def parse_text(text: str, expected_cites: int, bib_keys: list[tuple[int, int]], 
 _LABEL_AT_END = re.compile(r"(?:^|\s)(\[[^\[\]\s]{1,24}\]|\([^()\s]{1,24}\)|\d{1,3}\.)\s*$")
 
 
-def _attach_labels(entries: list[tuple[str, list[Run]]]) -> list[tuple[str, list[Run]]]:
-    """Labels print before the entry marker, so they trail the previous entry: move them back."""
+_LABEL_FORMS = {"[": re.compile(r"(?:^|\s)(\[[^\[\]\s]{1,24}\])\s*$"), "(": re.compile(r"(?:^|\s)(\([^()\s]{1,24}\))\s*$"),
+                ".": re.compile(r"(?:^|\s)(\d{1,3}\.)\s*$")}
+
+
+def _label_form(label: str) -> re.Pattern:
+    return _LABEL_FORMS[label[0] if label[0] in "[(" else "."]
+
+
+def _attach_labels(entries: list[tuple[str, list[Run]]], form: re.Pattern | None = None) -> list[tuple[str, list[Run]]]:
+    """Labels print before the entry marker, so they trail the previous entry: move them back. Only in a list
+    whose first entry showed a label (``form`` is its shape): author-year lists have none, and "p. 5." at the end
+    of an entry must stay where it is."""
     out = []
+    if form is None:
+        return list(entries)
     pending = None
     for i, (k, runs) in enumerate(entries):
         if pending:
@@ -326,7 +334,7 @@ def _attach_labels(entries: list[tuple[str, list[Run]]]) -> list[tuple[str, list
             pending = None
         if runs and i < len(entries) - 1:  # only when an entry follows: its label is what trails this one
             last = runs[-1]
-            m = _LABEL_AT_END.search(last.text)
+            m = form.search(last.text)
             if m and not last.url:
                 pending = m.group(1)
                 head = last.text[:m.start()].rstrip()

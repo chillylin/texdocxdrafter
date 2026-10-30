@@ -440,3 +440,28 @@ Refs \ref{fig:b}, \ref{fig:c}, \ref{eq:b}.""")
     msgs = [e.message for e in res.audit.entries if e.kind == "numbering"]
     assert any("reset to LaTeX's number" in m for m in msgs), msgs
     assert all(e.severity == "info" for e in res.audit.entries if e.kind == "numbering"), msgs
+
+
+def test_stale_aux_does_not_drive_the_sequences(tmp_path):
+    """D1: an .aux older than the sources, or lacking a label of the document, must not reset Word's numbering."""
+    body = r"""\begin{figure}\includegraphics{pic.png}\caption{New first}\label{fig:new}\end{figure}
+\begin{figure}\includegraphics{pic.png}\caption{Alpha}\label{fig:a}\end{figure}
+\begin{figure}\includegraphics{pic.png}\caption{Beta}\label{fig:b}\end{figure}"""
+    # (a) the .aux knows the old numbering only (fig:a was 1, fig:b was 2) and is older than the source
+    src = _doc(tmp_path, body)
+    aux = src.with_suffix(".aux")
+    aux.write_text("\\relax\n\\newlabel{fig:a}{{1}{1}}\n\\newlabel{fig:b}{{2}{1}}\n")
+    old = os.stat(src).st_mtime - 600
+    os.utime(aux, (old, old))
+    res = build(src, no_harvest=True, log=_quiet)
+    paras = _paras(_xml(tmp_path))
+    assert "Figure 1: New first" in paras and "Figure 2: Alpha" in paras and "Figure 3: Beta" in paras, paras
+    assert "\\r " not in _xml(tmp_path)
+    msgs = [e.message for e in res.audit.entries if e.kind == "numbering"]
+    assert any("not the compile of these sources" in m and "older than main.tex" in m and "fig:new" in m for m in msgs), msgs
+    assert any(e.severity == "warn" for e in res.audit.entries if "not the compile" in e.message)
+    # (b) a fresh .aux that still lacks a label is stale too
+    os.utime(aux, None)
+    res = build(src, no_harvest=True, overwrite=True, log=_quiet)
+    assert "\\r " not in _xml(tmp_path)
+    assert any("has no entry for label(s) fig:new" in e.message for e in res.audit.entries)

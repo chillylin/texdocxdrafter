@@ -557,7 +557,7 @@ class DocxWriter:
         n = self.seq[kind]
         info = self.labels.get(label) if label else None
         if info and info.number and info.number != str(n):
-            if info.number.isdigit():
+            if info.number.isdigit() and not self.res.aux_stale:  # a stale .aux would number two figures alike
                 n = int(info.number)
                 self.seq[kind] = n
                 self.audit.add("numbering", f"{kind} '{label}': LaTeX number {n} differs from Word's running count; "

@@ -88,6 +88,33 @@ class Resolved:
     labels: dict[str, LabelInfo]
     aux: dict[str, AuxLabel] = field(default_factory=dict)
     harvest_ok: bool = False
+    aux_stale: bool = False  # the .aux predates a source or lacks a label of the document: its numbers are not trusted
+
+
+def aux_is_stale(pf, labels: dict, aux: dict, audit: Audit) -> bool:
+    """True when the .aux cannot be the compile of these sources: older than one of them, or missing a label the
+    document defines. Then LaTeX's numbers must not drive Word's sequences."""
+    import os
+
+    if not pf.aux or not pf.aux.is_file():
+        return False
+    reasons = []
+    try:
+        aux_m = os.stat(pf.aux).st_mtime
+        newer = [p for p in {pf.main} | {pf.srcdir / f for f, _ in pf.source.origins}
+                 if p.is_file() and os.stat(p).st_mtime > aux_m + 1]
+        if newer:
+            reasons.append(f"older than {', '.join(sorted(p.name for p in newer)[:3])}")
+    except OSError:
+        pass
+    missing = [k for k, info in labels.items() if k not in aux and info.kind != "para"]
+    if missing:
+        reasons.append(f"has no entry for label(s) {', '.join(sorted(missing)[:3])}")
+    if reasons:
+        audit.add("numbering", f"{pf.aux.name} is not the compile of these sources ({'; '.join(reasons)}): LaTeX's "
+                               "numbers are not used for Word's figure, table and equation sequences. Recompile to "
+                               "have them agree")
+    return bool(reasons)
 
 
 def resolve(doc: Document, pf, audit: Audit, harvest=None) -> Resolved:
@@ -100,8 +127,9 @@ def resolve(doc: Document, pf, audit: Audit, harvest=None) -> Resolved:
         audit.add("label", issue)
     labels = collect_labels(doc, aux, audit)
     check_refs(doc, labels, audit)
+    stale = aux_is_stale(pf, labels, aux, audit)
     ok = False
     if harvest is not None and (harvest.cites or harvest.bibs):
         apply_harvest(doc, harvest, audit)
         ok = harvest.ok
-    return Resolved(doc, labels, aux, ok)
+    return Resolved(doc, labels, aux, ok, stale)

@@ -175,3 +175,53 @@ def test_same_work_in_two_refsections_builds_with_linked_citations(tmp_path):
     assert xml.count("Addison-Wesley") >= 3  # Knuth twice, Lamport once
     anchors = re.findall(r'w:anchor="([^"]+)"', xml)
     assert len(anchors) == 3 and len(set(anchors)) == 3, anchors  # each citation points into its own section's list
+
+
+def test_no_label_is_peeled_from_an_unlabelled_list():
+    """D2: author-year lists have no labels; an entry ending "p. 5." keeps its page number."""
+    from texdocxdrafter.audit import Audit
+    from texdocxdrafter.harvest import parse_text
+
+    text = ("@@xBIB 0 0@@x @@xENTRY a@@x Knuth, Donald (1984). The TeXbook. In: J, p. 5. @@xENTRY b@@x Report, Rita (2019). "
+            "Vol. 3. @@xENTRY c@@x Smith (2020). No. 12. @@xENDBIB@@x")
+    res = parse_text(text, 0, [(0, 0)], Audit(), "x")
+    texts = ["".join(r.text for r in runs) for _, runs in res.bibs[(0, 0)]]
+    assert texts == ["Knuth, Donald (1984). The TeXbook. In: J, p. 5.", "Report, Rita (2019). Vol. 3.", "Smith (2020). No. 12."], texts
+    # a numbered list still moves its labels, and only labels of its own form
+    text = "@@xBIB 0 0@@x 1. @@xENTRY a@@x Knuth. In: J, p. 5. 2. @@xENTRY b@@x Report [3]. 3. @@xENTRY c@@x Smith. @@xENDBIB@@x"
+    res = parse_text(text, 0, [(0, 0)], Audit(), "x")
+    texts = ["".join(r.text for r in runs) for _, runs in res.bibs[(0, 0)]]
+    assert texts == ["1. Knuth. In: J, p. 5.", "2. Report [3].", "3. Smith."], texts
+
+
+MIXED_DOC = r"""\documentclass{article}
+\usepackage[style=verbose,backend=biber]{biblatex}
+\addbibresource{refs.bib}
+\begin{document}
+First\footcite{knuth84} and then\autocite[7]{knuth84} and Lamport\footcite[3]{lamport94}.
+\printbibliography
+\end{document}
+"""
+
+
+@pytest.mark.skipif(not (HAVE_TOOLS and sandbox.have_os_sandbox()), reason="pdflatex, biber, poppler or bubblewrap missing")
+def test_footcite_and_autocite_share_bibliographys_repeat_tracking(tmp_path):
+    """D3: \\footcite is typeset as a footnote in the side document too, so the repeat is short and the notes
+    keep their closing period."""
+    import re
+
+    src = tmp_path / "main.tex"
+    src.write_text(MIXED_DOC)
+    (tmp_path / "refs.bib").write_text(BIB)
+    for cmd in (["pdflatex", "-interaction=batchmode", "main"], ["biber", "main"], ["pdflatex", "-interaction=batchmode", "main"]):
+        subprocess.run(cmd, cwd=tmp_path, capture_output=True, timeout=120)
+    res = build(src, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    z = zipfile.ZipFile(tmp_path / "main.docx")
+    fn = z.read("word/footnotes.xml").decode()
+    notes = re.findall(r'<w:footnote w:id="\d+">(.*?)</w:footnote>', fn, re.S)
+    texts = ["".join(re.findall(r"<w:t(?: [^>]*)?>([^<]*)</w:t>", n)).strip() for n in notes]
+    assert len(texts) == 3, texts
+    assert texts[0].startswith("Donald E. Knuth. The TeXbook") and texts[0].endswith("."), texts
+    assert texts[1] == "Knuth, The TeXbook, p. 7.", texts  # the repeat is short: both citations are footnotes
+    assert texts[2].startswith("Leslie Lamport") and "p. 3" in texts[2] and texts[2].endswith("."), texts
