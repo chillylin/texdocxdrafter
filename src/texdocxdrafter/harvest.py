@@ -22,12 +22,18 @@ from .preflight import Preflight, side_preamble
 OVERRIDES = r"""
 % ---- texdocxdrafter harvest overrides -------------------------------------------------------------
 \makeatletter
-\@ifpackageloaded{geometry}{\geometry{paperwidth=500cm,paperheight=500cm,margin=1cm}}{%
-  \usepackage[paperwidth=500cm,paperheight=500cm,margin=1cm]{geometry}}
+\@ifpackageloaded{geometry}{\geometry{paperwidth=500cm,paperheight=500cm,margin=1cm,left=3cm}}{%
+  \usepackage[paperwidth=500cm,paperheight=500cm,margin=1cm,left=3cm]{geometry}}
 \makeatother
 \makeatletter
+% a citation that sits in a footnote of the document: biblatex's trackers (citetracker=context, ibid, idem)
+% keep footnote and body citations apart, so it must be typeset in footnote context here too
+\newcommand*\wfInFN[1]{{\@ifundefined{etb@tgl@blx@footnote}{}{\toggletrue{blx@footnote}}#1}}%
 \AtBeginDocument{%
   \hyphenpenalty=10000 \exhyphenpenalty=10000 \sloppy \raggedright \pagestyle{empty}%
+  % bibliography labels ([1], [Knu84], 12., a shorthand) are the item labels of the list: mark them
+  \let\wf@list\list%
+  \def\list#1#2{\wf@list{#1}{#2\def\makelabel##1{{\ttfamily @@LABEL@@}##1{\ttfamily @@/LABEL@@}\hfil}}}%
   \renewcommand{\TeX}{TeX}\renewcommand{\LaTeX}{LaTeX}\renewcommand{\LaTeXe}{LaTeX2e}%
   \renewcommand{\footnote}[2][]{{\ttfamily @@FN@@}#2{\ttfamily @@/FN@@}}%  footnote citations (verbose styles,
   \renewcommand{\footnotetext}[2][]{{\ttfamily @@FN@@}#2{\ttfamily @@/FN@@}}% \footcite): their text, inline
@@ -118,6 +124,8 @@ def build_harvest_tex(pf: Preflight, doc: Document, nonce: str = "") -> tuple[st
             out.append("\\begin{refsection}")
         for c in (c for c in cites if c.section == s):
             raw = c.raw  # \\footcite stays one: biblatex tracks repeats of text and footnote citations apart
+            if c.in_footnote:  # and a citation in a footnote of the document stays in footnote context
+                raw = "\\wfInFN{%s\\relax}" % raw
             # \\relax ends the argument list of biblatex's \\cites, \\parencites, ...: without it the marker group
             # that follows would be read as one more citation
             out.append("{\\ttfamily @@CITE %d@@} %s\\relax{\\ttfamily @@END@@}\\par" % (c.index, raw))
@@ -282,21 +290,29 @@ def parse_text(text: str, expected_cites: int, bib_keys: list[tuple[int, int]], 
             body = body[:tm.start()] + body[tm.end():]
         entries = []
         parts = _marker(r"@@ENTRY (\S+?)@@", nonce).split(body)
-        lead = parts[0].strip()
+        label_re = _marker(r"@@LABEL@@(.*?)@@/LABEL@@", nonce)
+        marked = bool(label_re.search(body))
+        # a label ("[1]", "[Knu84]", "12.", a shorthand) is the list item's label: it prints before the entry
+        # marker, so the first one sits in the lead chunk and every other one trails the previous entry. The
+        # side document marks them, and the label found in a chunk belongs to the entry that follows the chunk
+        pending = _last_label(label_re, parts[0])
+        lead = label_re.sub("", parts[0]).strip()
         for i in range(1, len(parts), 2):
             ekey, etxt = parts[i], parts[i + 1]
-            runs = linkify(to_runs(etxt, nonce))
-            # numeric styles print a label before the marker: it ends up in the previous chunk
+            runs = linkify(to_runs(label_re.sub("", etxt), nonce))
+            if pending:
+                runs = [Run(pending + " ", frozenset())] + runs
+            pending = _last_label(label_re, etxt)
             entries.append((ekey, runs))
-        # labels (e.g. "[1]", "[Knu84]", "12.") print before the entry marker, so the first one is in the lead
-        # chunk and every other one trails the previous entry: move them back
-        lm = _LABEL_AT_END.search(lead) if lead else None
-        form = None
-        if lm and entries:
-            k, rs = entries[0]
-            entries[0] = (k, [Run(lm.group(1) + " ", frozenset())] + rs)
-            form = _label_form(lm.group(1))
-        res.bibs[key] = _attach_labels(entries, form)
+        if not marked:  # no marked labels (a bibliography that is not a LaTeX list): the older text heuristic
+            lm = _LABEL_AT_END.search(lead) if lead else None
+            form = None
+            if lm and entries:
+                k, rs = entries[0]
+                entries[0] = (k, [Run(lm.group(1) + " ", frozenset())] + rs)
+                form = _label_form(lm.group(1))
+            entries = _attach_labels(entries, form)
+        res.bibs[key] = entries
     missing = [i for i in range(expected_cites) if i not in res.cites]
     if missing:
         audit.add("harvest", f"{len(missing)} citation(s) missing from the harvest output: {missing[:10]}")
@@ -307,12 +323,20 @@ def parse_text(text: str, expected_cites: int, bib_keys: list[tuple[int, int]], 
     return res
 
 
-# a bibliography label as numeric and alphabetic styles print it: [1], [Knu84], (12), 12.  (at the end of a chunk;
-# at most three digits for the bare form, so that a year closing an entry, "2020.", is never taken for one)
-_LABEL_AT_END = re.compile(r"(?:^|\s)(\[[^\[\]\s]{1,24}\]|\([^()\s]{1,24}\)|\d{1,3}\.)\s*$")
+def _last_label(label_re: re.Pattern, chunk: str) -> str | None:
+    """The last marked, non-empty label in ``chunk`` (an unlabelled list marks empty ones)."""
+    labels = [re.sub(r"\s+", " ", m).strip() for m in label_re.findall(chunk)]
+    labels = [lab for lab in labels if lab]
+    return labels[-1] if labels else None
 
 
-_LABEL_FORMS = {"[": re.compile(r"(?:^|\s)(\[[^\[\]\s]{1,24}\])\s*$"), "(": re.compile(r"(?:^|\s)(\([^()\s]{1,24}\))\s*$"),
+# the text heuristic for a bibliography whose labels are not marked (not typeset as a LaTeX list): a label as
+# numeric and alphabetic styles print it, [1], [Knu84], [Kant KpV], (12), 12., at the end of a chunk; at most
+# three digits for the bare form, so that a year closing an entry, "2020.", is never taken for one
+_LABEL_AT_END = re.compile(r"(?:^|\s)(\[[^\[\]]{1,40}\]|\([^()]{1,40}\)|\d{1,3}\.)\s*$")
+
+
+_LABEL_FORMS = {"[": re.compile(r"(?:^|\s)(\[[^\[\]]{1,40}\])\s*$"), "(": re.compile(r"(?:^|\s)(\([^()]{1,40}\))\s*$"),
                 ".": re.compile(r"(?:^|\s)(\d{1,3}\.)\s*$")}
 
 

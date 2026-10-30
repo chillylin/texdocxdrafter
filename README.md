@@ -395,7 +395,13 @@ contents of table cells, citations (the harvest line gives their count), metadat
   its own and the report asks for a recompile.
   `\caption*` gives an unnumbered caption that does not advance the sequence.
 - Footnote citations (`\footcite`, and `\autocite` in verbose styles) become Word footnotes holding the
-  citation text as LaTeX set it; inside a footnote they are written in parentheses.
+  citation text as LaTeX set it. A citation inside a `\footnote` is typeset in biblatex's footnote context in
+  the side document too, so the repeat, ibid. and idem trackers of verbose and -ibid styles give the same short
+  forms as the PDF. A footnote citation inside a footnote is written in parentheses, as biblatex writes it.
+  A period the source puts right after a citation that ends in one ("ibid." followed by ".") is dropped, as
+  biblatex drops it.
+- Bibliography labels (`[1]`, `[Knu84]`, `12.`, a shorthand) are read from the list labels biblatex typesets,
+  whatever their shape; a bibliography that is not a LaTeX list falls back to a text pattern for them.
 - `\numberwithin` (per-section equation numbers) is not reproduced; Word numbers continuously.
 - A multi-line numbered `align` loses its alignment points (each numbered line is its own row);
   unnumbered `align*` keeps them.

@@ -225,3 +225,144 @@ def test_footcite_and_autocite_share_bibliographys_repeat_tracking(tmp_path):
     assert texts[0].startswith("Donald E. Knuth. The TeXbook") and texts[0].endswith("."), texts
     assert texts[1] == "Knuth, The TeXbook, p. 7.", texts  # the repeat is short: both citations are footnotes
     assert texts[2].startswith("Leslie Lamport") and "p. 3" in texts[2] and texts[2].endswith("."), texts
+
+
+def test_marked_labels_belong_to_the_entry_that_follows():
+    """E1: the side document marks every list label; the label before an entry marker is that entry's, whatever
+    its shape ("[Kant KpV]" with a space, "[1]", "12."), and an unlabelled list marks empty labels."""
+    from texdocxdrafter.audit import Audit
+    from texdocxdrafter.harvest import parse_text
+
+    text = ("@@xBIB 0 0@@x @@xLABEL@@x[Kant KpV]@@x/LABEL@@x @@xENTRY kant@@x Immanuel Kant. KpV. 1788. "
+            "@@xLABEL@@x [Knu84] @@x/LABEL@@x @@xENTRY knuth84@@x Knuth, The TeXbook. 1984. @@xLABEL@@x12.@@x/LABEL@@x "
+            "@@xENTRY lamport94@@x Lamport, LaTeX. 1994. [3] @@xENDBIB@@x")
+    res = parse_text(text, 0, [(0, 0)], Audit(), "x")
+    texts = ["".join(r.text for r in runs) for _, runs in res.bibs[(0, 0)]]
+    assert texts == ["[Kant KpV] Immanuel Kant. KpV. 1788.", "[Knu84] Knuth, The TeXbook. 1984.",
+                     "12. Lamport, LaTeX. 1994. [3]"], texts
+    text = ("@@xBIB 0 0@@x @@xLABEL@@x@@x/LABEL@@x @@xENTRY a@@x Knuth, Donald (1984). The TeXbook, p. 5. "
+            "@@xLABEL@@x @@x/LABEL@@x @@xENTRY b@@x Report (2019). Vol. 3. @@xENDBIB@@x")
+    res = parse_text(text, 0, [(0, 0)], Audit(), "x")
+    texts = ["".join(r.text for r in runs) for _, runs in res.bibs[(0, 0)]]
+    assert texts == ["Knuth, Donald (1984). The TeXbook, p. 5.", "Report (2019). Vol. 3."], texts
+
+
+FOOTNOTE_DOC = r"""\documentclass{article}
+\usepackage[style=verbose,backend=biber]{biblatex}
+\addbibresource{refs.bib}
+\begin{document}
+Body text.\footnote{See \cite[5]{knuth84}.} More\footcite[7]{knuth84} and body \cite{knuth84} then \cite{lamport94} and \cite{lamport94}.
+Nested\footnote{A note with \footcite[9]{lamport94} inside.} end.
+\printbibliography
+\end{document}
+"""
+
+
+def test_side_document_keeps_a_footnotes_citation_in_footnote_context(tmp_path):
+    """E2: a citation inside \\footnote is typeset inside biblatex's footnote context in the side document."""
+    from texdocxdrafter.audit import Audit
+    from texdocxdrafter.parser import parse_document
+    from texdocxdrafter.preflight import preflight
+
+    src = tmp_path / "main.tex"
+    src.write_text(FOOTNOTE_DOC)
+    (tmp_path / "refs.bib").write_text(BIB)
+    pf = preflight(src, need_build_files=False)
+    doc = parse_document(pf, Audit())
+    tex, _ = build_harvest_tex(pf, doc, "abcd")
+    assert "\\wfInFN{\\cite[5]{knuth84}\\relax}\\relax{\\ttfamily @@abcdEND@@abcd}" in tex, tex
+    assert "\\wfInFN{\\footcite[9]{lamport94}\\relax}" in tex, tex
+    assert "@@abcdCITE 1@@abcd} \\footcite[7]{knuth84}\\relax" in tex, tex  # a body citation is not wrapped
+    assert "\\toggletrue{blx@footnote}" in tex and "@@abcdLABEL@@abcd" in tex
+
+
+def _compile(tmp_path, doc: str, bib: str = BIB):
+    src = tmp_path / "main.tex"
+    src.write_text(doc)
+    (tmp_path / "refs.bib").write_text(bib)
+    for cmd in (["pdflatex", "-interaction=batchmode", "main"], ["biber", "main"], ["pdflatex", "-interaction=batchmode", "main"]):
+        subprocess.run(cmd, cwd=tmp_path, capture_output=True, timeout=120)
+    assert (tmp_path / "main.bbl").is_file()
+    return src
+
+
+def _texts(tmp_path):
+    import re
+
+    z = zipfile.ZipFile(tmp_path / "main.docx")
+
+    def t(xml):
+        return "".join(re.findall(r"<w:t(?: [^>]*)?>([^<]*)</w:t>", xml))
+
+    doc = z.read("word/document.xml").decode()
+    paras = [t(p) for p in re.findall(r"<w:p[ >].*?</w:p>", doc, re.S)]
+    notes = []
+    if "word/footnotes.xml" in z.namelist():
+        fn = z.read("word/footnotes.xml").decode()
+        notes = [t(n).strip() for n in re.findall(r'<w:footnote w:id="\d+">(.*?)</w:footnote>', fn, re.S)]
+    return [p for p in paras if p.strip()], notes
+
+
+@pytest.mark.skipif(not (HAVE_TOOLS and sandbox.have_os_sandbox()), reason="pdflatex, biber, poppler or bubblewrap missing")
+def test_citations_in_footnotes_keep_footnote_context_and_nested_notes_are_parenthesised(tmp_path):
+    """E2, E3 end to end against what LaTeX prints: the footnote tracker has seen the \\cite inside \\footnote,
+    so the \\footcite repeat is short and the first body citation full; a \\footcite inside a footnote is
+    biblatex's parenthesised note, once, without a closing period and with a single space before it."""
+    src = _compile(tmp_path, FOOTNOTE_DOC)
+    res = build(src, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    paras, notes = _texts(tmp_path)
+    assert paras[0] == ("Body text. More and body Donald E. Knuth. The TeXbook. Addison-Wesley, 1984 then Leslie Lamport. "
+                        "LaTeX: A Document Preparation System. Addison-Wesley, 1994 and Lamport, LaTeX: A Document "
+                        "Preparation System. Nested end."), paras[0]
+    assert notes == ["See Donald E. Knuth. The TeXbook. Addison-Wesley, 1984, p. 5.",
+                     "Knuth, The TeXbook, p. 7.",
+                     "A note with (Leslie Lamport. LaTeX: A Document Preparation System. Addison-Wesley, 1994, p. 9) inside."], notes
+
+
+IBID_DOC = r"""\documentclass{article}
+\usepackage[style=authoryear-ibid,backend=biber]{biblatex}
+\addbibresource{refs.bib}
+\begin{document}
+Body text.\footnote{See \cite{lamport94}.} More.\footnote{Again \cite{lamport94}.} Then \cite{lamport94} and \cite{lamport94}.
+\printbibliography
+\end{document}
+"""
+
+
+@pytest.mark.skipif(not (HAVE_TOOLS and sandbox.have_os_sandbox()), reason="pdflatex, biber, poppler or bubblewrap missing")
+def test_ibid_follows_footnote_context_and_the_period_after_it_is_not_doubled(tmp_path):
+    """E2 with authoryear-ibid: the second footnote is "ibid." because the first footnote cited the work; the body
+    starts afresh. The period the source puts after "ibid." is dropped as biblatex drops it."""
+    src = _compile(tmp_path, IBID_DOC)
+    res = build(src, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    paras, notes = _texts(tmp_path)
+    assert paras[0] == "Body text. More. Then Lamport 1994 and ibid.", paras[0]
+    assert notes == ["See Lamport 1994.", "Again ibid."], notes
+
+
+ALPHA_DOC = r"""\documentclass{article}
+\usepackage[style=alphabetic,backend=biber]{biblatex}
+\addbibresource{refs.bib}
+\begin{document}
+Cites \cite{kant}, \cite{knuth84}, \cite{lamport94}.
+\printbibliography
+\end{document}
+"""
+
+KANT = r"""@book{kant, author={Immanuel Kant}, title={Kritik der praktischen Vernunft}, year={1788}, shorthand={Kant KpV}, publisher={Hartknoch}}
+"""
+
+
+@pytest.mark.skipif(not (HAVE_TOOLS and sandbox.have_os_sandbox()), reason="pdflatex, biber, poppler or bubblewrap missing")
+def test_alphabetic_labels_with_a_shorthand_stay_with_their_entry(tmp_path):
+    """E1 end to end: a shorthand with a space sorted first did not fit the old label pattern, and every label
+    then went to the entry before its own."""
+    src = _compile(tmp_path, ALPHA_DOC, BIB + KANT)
+    res = build(src, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    paras, _ = _texts(tmp_path)
+    assert paras[-3:] == ["[Kant KpV] Immanuel Kant. Kritik der praktischen Vernunft. Hartknoch, 1788.",
+                          "[Knu84] Donald E. Knuth. The TeXbook. Addison-Wesley, 1984.",
+                          "[Lam94] Leslie Lamport. LaTeX: A Document Preparation System. Addison-Wesley, 1994."], paras

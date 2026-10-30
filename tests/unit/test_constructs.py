@@ -465,3 +465,20 @@ def test_stale_aux_does_not_drive_the_sequences(tmp_path):
     res = build(src, no_harvest=True, overwrite=True, log=_quiet)
     assert "\\r " not in _xml(tmp_path)
     assert any("has no entry for label(s) fig:new" in e.message for e in res.audit.entries)
+
+
+def test_inline_note_parentheses_and_spacing():
+    """E3: a note written inline inside a footnote gets one space before it and no period inside the closing
+    parenthesis; biblatex's own parenthesised nested note is kept as it is."""
+    from texdocxdrafter.writer import _parenthesised, _space_before
+    from texdocxdrafter.writer.xmlutil import q, run
+
+    def text(els):
+        return "".join(t.text for e in els for t in e.iter(q("w:t")))
+
+    assert _space_before([run("A note with ")]) == ""
+    assert _space_before([run("A note with")]) == " "
+    assert _space_before([]) == ""
+    assert text(_parenthesised([run("Knuth, The TeXbook, p. 9.")], " ")) == " (Knuth, The TeXbook, p. 9)"
+    assert text(_parenthesised([run("(Knuth, The TeXbook, p. 9)")], " ")) == " (Knuth, The TeXbook, p. 9)"
+    assert text(_parenthesised([run("(Knuth, p. 9)")], "")) == "(Knuth, p. 9)"

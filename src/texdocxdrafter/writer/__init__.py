@@ -49,6 +49,31 @@ def bm_name(prefix: str, key: str) -> str:
     return name
 
 
+def _texts(els) -> list:
+    """The w:t elements of ``els`` in order (inside hyperlinks too)."""
+    return [t for e in els for t in e.iter(q("w:t"))]
+
+
+def _space_before(els) -> str:
+    """The space that separates an inline note from the text before it: none at the start of a paragraph or
+    after text that already ends in a space."""
+    ts = _texts(els)
+    t = ts[-1].text if ts else None
+    return "" if not t or t[-1].isspace() else " "
+
+
+def _parenthesised(els: list, space: str) -> list:
+    """A note written inline in parentheses. biblatex prints a note inside a note in parentheses itself (and
+    without its closing period); otherwise the parentheses are added here and the note's closing period dropped."""
+    ts = _texts(els)
+    first, last = (ts[0].text or "") if ts else "", (ts[-1].text or "") if ts else ""
+    if first.lstrip().startswith("(") and last.rstrip().endswith(")"):
+        return ([run(space)] if space else []) + list(els)
+    if last.rstrip().endswith("."):
+        ts[-1].text = last.rstrip()[:-1]
+    return [run(space + "(")] + list(els) + [run(")")]
+
+
 class DocxWriter:
     def __init__(self, resolved, pf, sm: dict, audit: Audit, template=None, link_citations: bool = False):
         self.res = resolved
@@ -159,10 +184,16 @@ class DocxWriter:
     def inl(self, items: list, flags: frozenset = frozenset(), link: bool = False) -> list:
         out: list = []
         items = _swap_space(items)
+        drop_dot = False  # biblatex's autopunct: a period right after a citation that ends in one ("ibid.") is dropped
         for x in items:
             if isinstance(x, Text):
-                out.append(self.text_run(x.text, flags, link))
-            elif isinstance(x, Styled):
+                text = x.text[1:] if drop_dot and x.text.startswith(".") else x.text
+                drop_dot = False
+                if text:
+                    out.append(self.text_run(text, flags, link))
+                continue
+            drop_dot = False
+            if isinstance(x, Styled):
                 if x.kind == "color":
                     nf = flags | {("color", x.arg or "black")}
                 elif x.kind == "emph" and "emph" in flags:
@@ -175,7 +206,7 @@ class DocxWriter:
             elif isinstance(x, Footnote):
                 if self.fn_depth:  # Word has no footnotes inside footnotes: the inner one is written in parentheses
                     self.audit.add("raw", "footnote inside a footnote written inline in parentheses", x.loc)
-                    out.append(run(" ("))
+                    out.append(run(_space_before(out) + "("))
                     for i, b in enumerate(x.blocks):
                         if isinstance(b, Para):
                             if i:
@@ -185,7 +216,10 @@ class DocxWriter:
                 else:
                     out.append(self.footnote_ref(x))
             elif isinstance(x, Cite):
-                out.extend(self.cite_elements(x))
+                els = self.cite_elements(x, _space_before(out))
+                out.extend(els)
+                ts = _texts(els)
+                drop_dot = bool(ts) and self.pf.uses_biblatex and (ts[-1].text or "").endswith(".")
             elif isinstance(x, Ref):
                 out.extend(self.ref_elements(x, flags))
             elif isinstance(x, InlineMath):
@@ -223,7 +257,9 @@ class DocxWriter:
         return [h]
 
     # ---- citations ---------------------------------------------------------------------------
-    def cite_elements(self, c: Cite) -> list:
+    def cite_elements(self, c: Cite, space: str = " ") -> list:
+        """``space`` is what separates an inline note from the text before it: nothing when that text already
+        ends in a space."""
         if c.cmd == "nocite":
             return []
         runs = c.runs
@@ -256,14 +292,14 @@ class DocxWriter:
             target.append(run(r.text, rs, props))
         if note:
             if self.fn_depth:  # already inside a footnote: Word cannot nest them
-                els[note_at:note_at] = [run(" (")] + note + [run(")")]
+                els[note_at:note_at] = _parenthesised(note, space if note_at == 0 else _space_before(els[:note_at]))
             else:
                 els.insert(note_at, self.footnote_from_elements(note))
                 self.audit.count("citations in footnotes")
             return els
         if c.cmd in FOOT_CITES:
-            if self.fn_depth:
-                return [run(" (")] + els + [run(")")]
+            if self.fn_depth:  # a note inside a note: biblatex prints it in parentheses, and so does the writer
+                return _parenthesised(els, space)
             self.audit.count("citations in footnotes")
             return [self.footnote_from_elements(els)]
         if self.link_citations:
