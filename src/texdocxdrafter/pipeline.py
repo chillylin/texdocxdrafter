@@ -286,7 +286,10 @@ def _write_tmp(path: Path, data: bytes, mode: int | None = None) -> str:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp, mode if mode is not None else 0o666 & ~_umask())
+        try:
+            os.chmod(tmp, mode if mode is not None else 0o666 & ~_umask())
+        except OSError:
+            pass  # FAT/exFAT cannot store modes (EPERM): the content matters, the mode is best effort
     except BaseException:
         os.unlink(tmp)
         raise
@@ -398,19 +401,20 @@ def publish(items: list[tuple]) -> None:
             done.append((path, previous))
     except BaseException as exc:
         failed: list[str] = []
+        restored: list[str] = []
         for path, previous in reversed(done):
             try:
                 if previous is None:
                     os.unlink(path)
                 else:
                     write_atomic(path, previous)
+                restored.append(path.name)
             except OSError as e2:
                 failed.append(f"{path.name} ({e2.strerror or e2})")
         if failed:
-            left = [p.name for p, _ in done]
-            raise PublishError(f"publishing failed ({exc}) and the files already written could not be put back: "
-                               f"{', '.join(failed)}. {', '.join(left)} now hold the new build while the rest do not; "
-                               "when the problem is fixed, rerun with --overwrite to bring them in line") from exc
+            raise PublishError(f"publishing failed ({exc}); {', '.join(failed)} could not be put back and still "
+                               f"hold the new build" + (f", {', '.join(restored)} were restored" if restored else "")
+                               + "; when the problem is fixed, rerun with --overwrite to bring them in line") from exc
         raise
 
 

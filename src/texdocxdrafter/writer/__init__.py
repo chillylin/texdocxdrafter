@@ -696,14 +696,16 @@ class DocxWriter:
         if has_cap and pos == "above":
             self.caption("figure", f.caption, f.label, f.loc)
         multi = len(f.images) > 1
-        for i, img in enumerate(f.images):
+        panel = 0  # LaTeX letters the captioned subfigures only; a plain \\includegraphics beside them has no letter
+        for img in f.images:
             p = self.write_image(img)
             if img.label and p is not None:  # \\label inside a subfigure: a bookmark in the picture paragraph
                 for e in self.bookmark(self.label_bm(img.label), []):
                     p.append(e)
             if img.caption:
-                self.add(para(self.ps("figure_note"), ([run("(" + _panel(i) + ") ")] if multi else []) +
+                self.add(para(self.ps("figure_note"), ([run("(" + _panel(panel) + ") ")] if multi else []) +
                               self.inl(img.caption)))
+                panel += 1
         if has_cap and pos == "below":
             self.caption("figure", f.caption, f.label, f.loc)
         if f.notes:

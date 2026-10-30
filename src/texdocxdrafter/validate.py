@@ -109,7 +109,8 @@ def check_docx(path) -> CheckResult:
     for name, tree in trees.items():
         if not (name.startswith("word/") and name.endswith(".xml")):
             continue
-        rels = trees.get("word/_rels/" + name[len("word/"):] + ".rels")
+        folder, _, base = name.rpartition("/")
+        rels = trees.get(f"{folder}/_rels/{base}.rels")
         rel_ids = {r.get("Id") for r in rels} if rels is not None else set()
         for el in tree.iter():
             for attr in ("id", "embed", "link"):

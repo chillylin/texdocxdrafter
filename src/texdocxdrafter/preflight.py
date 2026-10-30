@@ -116,8 +116,8 @@ def _neighbour_has_text(lines: list[str], i: int, step: int) -> bool:
 _URL_MACROS = ("url", "href", "path", "nolinkurl")
 
 
-def _strip_comment(line: str) -> tuple[str, bool]:
-    """Return (text before an unescaped %, whether a comment was found).
+def _strip_comment(line: str) -> tuple[str, bool, int]:
+    """Return (text before an unescaped %, whether a comment was found, index of that % in ``line``).
 
     A % inside ``\\verb<d>...<d>`` or inside the argument of ``\\url``, ``\\href`` (first argument), ``\\path``
     and ``\\nolinkurl`` is part of the text, not a comment: ``\\url{a%20b}`` must not swallow the line. Inside
@@ -153,17 +153,17 @@ def _strip_comment(line: str) -> tuple[str, bool]:
                                 if depth == 0:
                                     break
                             k += 1
-                        out.append(line[i:j] + line[j:k + 1].replace("%", "\\%"))
+                        out.append(line[i:j] + re.sub(r"(?<!\\)%", r"\\%", line[j:k + 1]))  # an escaped \\% stays
                         i = k + 1
                         continue
             out.append(line[i:i + 2])
             i += 2
             continue
         if c == "%":
-            return "".join(out), True
+            return "".join(out), True, i
         out.append(c)
         i += 1
-    return "".join(out), False
+    return "".join(out), False, n
 
 
 def unescape_url(u: str) -> str:
@@ -328,12 +328,12 @@ def _flatten_file(path: Path, srcdir: Path, stack: tuple[Path, ...], issues: lis
             continue
         line = raw.lstrip(" \t") if swallow_leading else raw
         swallow_leading = False
-        text, had_comment = _strip_comment(line)
+        text, had_comment, at = _strip_comment(line)
         for em in _NO_COMMENT_ENVS.finditer(text):
             picture_depth = max(0, picture_depth + (1 if em.group(1) == "begin" else -1))
         if had_comment:
             swallow_leading = True
-            note = line[len(text) + 1:].strip()
+            note = line[at + 1:].strip()  # from the original line: the protected text may be longer
             if comments is not None and picture_depth == 0 and not _DECORATIVE.match(note):
                 if text.strip():
                     attach = "prev"

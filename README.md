@@ -397,7 +397,8 @@ contents of table cells, citations (the harvest line gives their count), metadat
   a body paragraph between two equation blocks.
 - Word has no footnotes inside footnotes: an inner footnote is written in parentheses inside the outer one
   (reported). A `longtable` footer repeated on every page (`\endfoot`) is dropped (reported); the closing rows
-  (`\endlastfoot`) follow the body.
+  (`\endlastfoot`) follow the body. `\multirow{-n}` is merged upwards only into empty cells of the same
+  width; otherwise its text stays in its own cell (reported), so nothing above it is ever overwritten.
 - A float with several `\caption`s gives one captioned table or figure per caption; tabulars inside a figure
   (or pictures inside a table) follow the main block.
 - Verify the result in Word at least once per document: open it, update fields, and insert a section

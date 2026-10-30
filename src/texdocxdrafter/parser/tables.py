@@ -183,8 +183,10 @@ class TableMixin:
                         for cc in range(col, col + cell.colspan):
                             occupied[cc] = cell.rowspan - 1
                     up = getattr(cell, "_rowspan_up", 0)
-                    if up > 1:  # \\multirow{-n}: the merge covers this row and the n-1 rows above it
-                        self._merge_upwards(table.rows, row, cell, col, up)
+                    if up > 1 and not self._merge_upwards(table.rows, row, cell, col, up):
+                        # \\multirow{-n}: the merge covers this row and the n-1 rows above it
+                        self.audit.add("table", f"\\multirow{{-{up}}} not merged: the cells above hold text or "
+                                       "span other columns; its text stays in its own cell", cell.loc)
                 row.cells.append(cell)
                 col += cell.colspan
             table.rows.append(row)
@@ -237,34 +239,34 @@ class TableMixin:
         return cell, content
 
     @staticmethod
-    def _merge_upwards(rows: list, row, cell, col: int, n: int) -> None:
+    def _merge_upwards(rows: list, row, cell, col: int, n: int) -> bool:
         """``\\multirow{-n}``: the text sits in the last row of a span that starts n-1 rows above. Give the span
-        to the top cell and make this one (and those between) continuations."""
+        to the top cell and make this one (and those between) continuations. Only when every cell above is empty,
+        starts at the same column and has the same width: nothing is ever overwritten. Returns whether it merged."""
         above = rows[-(n - 1):] if len(rows) >= n - 1 else rows[:]
         if not above:
-            return
+            return False
 
         def cell_at(r, c):
             k = 0
             for x in r.cells:
                 if k <= c < k + x.colspan:
-                    return x
+                    return x, k
                 k += x.colspan
-            return None
+            return None, None
 
-        top = cell_at(above[0], col)
-        if top is None or top.vmerge:
-            return
+        found = [cell_at(r, col) for r in above]
+        if any(x is None or x.vmerge or x.blocks or start != col or x.colspan != cell.colspan for x, start in found):
+            return False
+        top = found[0][0]
         top.rowspan = len(above) + 1
         top.blocks = cell.blocks
-        for r in above[1:]:
-            mid = cell_at(r, col)
-            if mid is not None:
-                mid.vmerge = True
-                mid.blocks = []
+        for x, _ in found[1:]:
+            x.vmerge = True
         cell.vmerge = True
         cell.rowspan = 1
         cell.blocks = []
+        return True
 
     def cell_blocks(self, nodes: list, header: bool) -> list:
         blocks = self.blocks(nodes)

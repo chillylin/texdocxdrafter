@@ -161,9 +161,10 @@ def test_failed_rollback_is_reported_not_swallowed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pipeline, "commit_file", failing)
     monkeypatch.setattr(pipeline, "write_atomic", lambda p, d: (_ for _ in ()).throw(OSError(errno.ENOSPC, "still full")))
-    with pytest.raises(PublishError, match="could not be put back: a.txt") as info:
+    with pytest.raises(PublishError, match="a.txt .* could not be put back and still hold the new build") as info:
         pipeline.publish([(a, b"new a", snap_a, "report"), (b, b"new b", None, "output")])
     assert "--overwrite" in str(info.value) and isinstance(info.value.__cause__, OSError)
+    assert "b.txt" not in str(info.value).split("could not be put back")[0]  # R7: only the files not restored are named
 
 
 def test_published_files_follow_the_umask_and_keep_their_mode(tmp_path, monkeypatch):
@@ -246,8 +247,14 @@ r1 & 1 \\
 r2 & 2 \\
 \end{longtable}
 \begin{tabular}{ll}
-x & 1 \\
+ & 1 \\
 \multirow{-2}{*}{Span} & 2 \\
+\end{tabular}
+\begin{tabular}{ll}
+x & 1 \\
+\multirow{-2}{*}{Kept} & 2 \\
+\multicolumn{2}{c}{Head} \\
+\multirow{-2}{*}{Also} & 4 \\
 \end{tabular}""")
     res = build(src, no_harvest=True, log=_quiet)
     xml = _xml(tmp_path)
@@ -256,11 +263,15 @@ x & 1 \\
     assert cells.index("Total") > cells.index("r2"), cells  # last footer after the body
     assert "(cont.)" not in " ".join(cells)
     assert any("per-page footer" in e.message for e in res.audit.entries)
-    # \multirow{-2}: the span starts one row above and the text sits in that top cell
-    rows = re.findall(r"<w:tr[ >].*?</w:tr>", xml, re.S)
-    span_rows = [r for r in rows if "Span" in _text(r)]
-    assert span_rows and 'w:val="restart"' in span_rows[0] and span_rows[0] is rows[-2] or _text(rows[-2]).startswith("Span"), \
-        [_text(r) for r in rows]
+    tables = re.findall(r"<w:tbl>.*?</w:tbl>", xml, re.S)
+    # \multirow{-2} over an empty cell: the span starts one row above and the text sits in that top cell
+    rows = re.findall(r"<w:tr[ >].*?</w:tr>", tables[1], re.S)
+    assert _text(rows[0]).startswith("Span") and 'w:val="restart"' in rows[0] and "Span" not in _text(rows[1]), [_text(r) for r in rows]
+    # R2: over cells that hold text or a \multicolumn, nothing is overwritten and the report says so
+    texts = " ".join(_text(r) for r in re.findall(r"<w:tr[ >].*?</w:tr>", tables[2], re.S))
+    for word in ("x", "Kept", "Head", "Also"):
+        assert word in texts.split() or word in texts, (word, texts)
+    assert sum("not merged" in e.message for e in res.audit.entries) == 2
 
 
 def test_single_subfigure_caption_panel_letters_and_subfigure_labels(tmp_path):
@@ -329,3 +340,63 @@ def test_fields_inside_tracked_deletions_are_checked(tmp_path):
         b'<w:r><w:fldChar w:fldCharType="end"/></w:r></w:del></w:p>')]}, {})
     errs = check_docx(out).errors
     assert any("policy" in e and "INCLUDETEXT" in e for e in errs), errs
+
+
+# ---- round 13: regressions of the above ------------------------------------------------------------------------
+
+
+def test_escaped_percent_in_url_is_kept_and_the_line_survives(tmp_path):
+    """R1: hyperref's recommended \\href{...a\\%20b}{} form; R4: the comment after a protected url is intact."""
+    src = _doc(tmp_path, "See \\href{https://ex.com/a\\%20b}{the page} for details. % Reviewer: check this\n"
+                         "Also \\url{https://ex.com/c%20d} here. % Reviewer: and this")
+    from texdocxdrafter.preflight import preflight
+
+    pf = preflight(src, need_build_files=False)
+    assert [c.text for c in pf.comments] == ["Reviewer: check this", "Reviewer: and this"]
+    res = build(src, no_harvest=True, log=_quiet)
+    rels = _xml(tmp_path, "word/_rels/document.xml.rels")
+    assert 'Target="https://ex.com/a%20b"' in rels and 'Target="https://ex.com/c%20d"' in rels, rels
+    text = _text(_xml(tmp_path))
+    assert "the page for details." in text and "https://ex.com/c%20d here." in text, text
+    assert not [e for e in res.audit.entries if "link target" in e.message], [e.message for e in res.audit.entries]
+
+
+def test_relationships_of_nested_parts_are_found_beside_them(tmp_path):
+    """R3: word/theme/theme1.xml keeps its .rels in word/theme/_rels/, not word/_rels/theme/."""
+    src = _doc(tmp_path, "Body.")
+    build(src, no_harvest=True, log=_quiet)
+    out = tmp_path / "main.docx"
+    theme = (b'<?xml version="1.0" encoding="UTF-8"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+             b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" name="t">'
+             b'<a:blip r:embed="rId1"/></a:theme>')
+    rels = (b'<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/fill.png"/>'
+            b'</Relationships>')
+    _rezip(out, {}, {"word/theme/theme1.xml": theme, "word/theme/_rels/theme1.xml.rels": rels, "word/media/fill.png": PNG})
+    errs = check_docx(out).errors
+    assert not [e for e in errs if "unresolved" in e], errs
+    _rezip(out, {"word/theme/theme1.xml": [(b'r:embed="rId1"', b'r:embed="rId7"')]}, {})
+    assert any("theme1.xml: unresolved relationship rId7" in e for e in check_docx(out).errors)
+
+
+def test_chmod_failure_on_fat_drives_does_not_abort(tmp_path, monkeypatch):
+    """R5: FAT/exFAT answer EPERM to chmod; the content still lands."""
+    monkeypatch.setattr(pipeline.os, "chmod", lambda *a, **k: (_ for _ in ()).throw(OSError(errno.EPERM, "Operation not permitted")))
+    target = tmp_path / "t.docx"
+    pipeline.commit_file(target, b"data", None, "output")
+    pipeline.commit_file(target, b"more", pipeline._snapshot(target), "output")
+    assert target.read_bytes() == b"more"
+    _no_temp_files(tmp_path)
+
+
+def test_panel_letters_skip_a_plain_picture_before_the_subfigures(tmp_path):
+    """R6: LaTeX letters captioned subfigures only."""
+    src = _doc(tmp_path, r"""\begin{figure}
+\includegraphics{pic.png}
+\begin{subfigure}{.5\linewidth}\includegraphics{pic.png}\caption{Left}\end{subfigure}
+\begin{subfigure}{.5\linewidth}\includegraphics{pic.png}\caption{Right}\end{subfigure}
+\caption{Three pictures}
+\end{figure}""")
+    build(src, no_harvest=True, log=_quiet)
+    paras = _paras(_xml(tmp_path))
+    assert "(a) Left" in paras and "(b) Right" in paras, paras
