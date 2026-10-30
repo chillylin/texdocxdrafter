@@ -153,6 +153,7 @@ class Table(Node):
     notes: list = field(default_factory=list)  # list of Para
     floating: bool = True
     wide: bool = False
+    unnumbered: bool = False  # \\caption*: no number, the sequence does not advance
 
 
 @dataclass
@@ -175,6 +176,7 @@ class Figure(Node):
     notes: list = field(default_factory=list)
     floating: bool = True
     wide: bool = False  # figure*: spans both columns
+    unnumbered: bool = False  # \\caption*
 
 
 @dataclass

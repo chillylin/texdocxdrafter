@@ -230,7 +230,9 @@ class DocxWriter:
         if runs is None:
             keys = ", ".join(re.findall(r"\{([^{}]*)\}", c.raw)[-1:]) or "?"
             return [run(f"[{keys}]", self.cs("todo"))]
-        els = []
+        els: list = []
+        note: list = []  # runs LaTeX put in a footnote (verbose styles, \\autocite as footnote, \\footcite)
+        note_at = None
         for r in runs:
             fmt = set(r.fmt)
             flags = set()
@@ -242,20 +244,33 @@ class DocxWriter:
                 flags.add("superscript")
             if "sub" in fmt:
                 flags.add("subscript")
+            target = note if "fn" in fmt else els
+            if "fn" in fmt and note_at is None:
+                note_at = len(els)
             if r.url:
-                els.extend(self.hyperlink(Link(url=r.url, children=[Text(text=r.text)]), frozenset(flags)))
+                target.extend(self.hyperlink(Link(url=r.url, children=[Text(text=r.text)]), frozenset(flags)))
                 continue
             rs, props = self.rformat(frozenset(flags))
             if rs is None:
                 rs = self.cs("citation")
-            els.append(run(r.text, rs, props))
+            target.append(run(r.text, rs, props))
+        if note:
+            if self.fn_depth:  # already inside a footnote: Word cannot nest them
+                els[note_at:note_at] = [run(" (")] + note + [run(")")]
+            else:
+                els.insert(note_at, self.footnote_from_elements(note))
+                self.audit.count("citations in footnotes")
+            return els
         if c.cmd in FOOT_CITES:
+            if self.fn_depth:
+                return [run(" (")] + els + [run(")")]
+            self.audit.count("citations in footnotes")
             return [self.footnote_from_elements(els)]
         if self.link_citations:
             keys = re.findall(r"\{([^{}]*)\}", c.raw)
             first = keys[-1].split(",")[0].strip() if keys else ""
             if first:
-                h = el("w:hyperlink", {"w:anchor": bm_name("_wfbib_", first), "w:history": "1"})
+                h = el("w:hyperlink", {"w:anchor": bm_name("_wfbib_", f"{c.section}:{first}"), "w:history": "1"})
                 for e in els:
                     h.append(e)
                 return [h]
@@ -521,19 +536,36 @@ class DocxWriter:
                 first = False
 
     # ---- captions, tables, figures -----------------------------------------------------------
-    def caption(self, kind: str, inlines: list | None, label: str | None, loc) -> None:
+    def caption(self, kind: str, inlines: list | None, label: str | None, loc, unnumbered: bool = False) -> None:
+        if unnumbered:  # \\caption*: the text alone, the sequence does not advance
+            kids = self.inl(inlines or [])
+            if label:
+                kids = self.bookmark(self.label_bm(label), kids)
+            self.add(para(self.ps("caption_" + kind), kids))
+            return
         self.seq[kind] += 1
-        n = self.seq[kind]
-        info = self.labels.get(label) if label else None
-        cached = str(n)
-        if info and info.number and info.number != cached:
-            self.audit.add("numbering", f"{kind} '{label}': LaTeX number {info.number} but Word sequence "
-                           f"position {n}", loc)
-        seq = field(f"SEQ {CAPTION_WORD[kind]} \\* ARABIC", cached)
+        seq = self.seq_field(kind, CAPTION_WORD[kind], label, loc)
         if label:
             seq = self.bookmark(self.label_bm(label), seq)
         kids = [run(CAPTION_WORD[kind] + " ")] + seq + [run(": ")] + self.inl(inlines or [])
         self.add(para(self.ps("caption_" + kind), kids))
+
+    def seq_field(self, kind: str, word: str, label: str | None, loc) -> list:
+        """The SEQ field of the current ``kind`` number. When LaTeX's number (from the .aux) is a plain integer
+        that differs from Word's running count (after \\setcounter, subequations, an appendix reset), the field
+        resets the sequence to LaTeX's number (``\\r``), so Word and LaTeX agree from here on."""
+        n = self.seq[kind]
+        info = self.labels.get(label) if label else None
+        if info and info.number and info.number != str(n):
+            if info.number.isdigit():
+                n = int(info.number)
+                self.seq[kind] = n
+                self.audit.add("numbering", f"{kind} '{label}': LaTeX number {n} differs from Word's running count; "
+                               "the sequence is reset to LaTeX's number here", loc, "info")
+                return field(f"SEQ {word} \\r {n} \\* ARABIC", str(n))
+            self.audit.add("numbering", f"{kind} '{label}': LaTeX number {info.number} but Word sequence "
+                           f"position {n}", loc)
+        return field(f"SEQ {word} \\* ARABIC", str(n))
 
     def write_notes(self, notes: list, key: str) -> None:
         saved = self.override
@@ -548,11 +580,11 @@ class DocxWriter:
             self.add(para(self.ps("body")))
         if t.caption is not None or t.label:
             if pos == "above":
-                self.caption("table", t.caption, t.label, t.loc)
+                self.caption("table", t.caption, t.label, t.loc, t.unnumbered)
         self.build_table(t)
         if t.caption is not None or t.label:
             if pos == "below":
-                self.caption("table", t.caption, t.label, t.loc)
+                self.caption("table", t.caption, t.label, t.loc, t.unnumbered)
         if t.notes:
             self.write_notes(t.notes, "table_note")
 
@@ -694,7 +726,7 @@ class DocxWriter:
         pos = self.sm["options"]["caption_position"]["figure"]
         has_cap = f.caption is not None or bool(f.label)
         if has_cap and pos == "above":
-            self.caption("figure", f.caption, f.label, f.loc)
+            self.caption("figure", f.caption, f.label, f.loc, f.unnumbered)
         multi = len(f.images) > 1
         panel = 0  # LaTeX letters the captioned subfigures only; a plain \\includegraphics beside them has no letter
         for img in f.images:
@@ -707,7 +739,7 @@ class DocxWriter:
                               self.inl(img.caption)))
                 panel += 1
         if has_cap and pos == "below":
-            self.caption("figure", f.caption, f.label, f.loc)
+            self.caption("figure", f.caption, f.label, f.loc, f.unnumbered)
         if f.notes:
             self.write_notes(f.notes, "figure_note")
 
@@ -1028,12 +1060,7 @@ class DocxWriter:
             cells[1].append(para(self.ps("equation"), self.display_runs(l, m)))
             if l.numbered:
                 self.seq["Equation"] += 1
-                n = self.seq["Equation"]
-                info = self.labels.get(l.label) if l.label else None
-                if info and info.number and info.number != str(n):
-                    self.audit.add("numbering", f"equation '{l.label}': LaTeX number {info.number} but Word "
-                                   f"sequence position {n}", l.loc)
-                seq = field("SEQ Equation \\* ARABIC", str(n))
+                seq = self.seq_field("Equation", "Equation", l.label, l.loc)
                 if l.label:
                     seq = self.bookmark(self.label_bm(l.label), seq)
                 cells[2].append(para(self.ps("equation_number"), [run("(")] + seq + [run(")")]))
@@ -1081,7 +1108,7 @@ class DocxWriter:
                     els.extend(self.hyperlink(Link(url=r.url, children=[Text(text=r.text)]), frozenset(flags)))
                 else:
                     els.append(self.text_run(r.text, frozenset(flags)))
-            els = self.bookmark(bm_name("_wfbib_", e.key), els)
+            els = self.bookmark(bm_name("_wfbib_", f"{b.section}:{e.key}"), els)  # per refsection: a work cited twice
             self.add(para(self.ps("bibliography"), els))
         if not b.entries:
             self.audit.add("harvest", "bibliography is empty", b.loc)

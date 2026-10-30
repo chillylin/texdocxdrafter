@@ -85,6 +85,7 @@ def manifest(doc: Document, audit: Audit) -> Manifest:
             m.footnotes += 1
 
     walk_tree(doc, visit)
+    m.footnotes += audit.census.get("citations in footnotes", 0)  # footnotes the writer makes for \\footcite and co.
     m.pictures = audit.census.get("figures embedded", 0)
     m.equations = audit.census.get("display math (OMML)", 0) + audit.census.get("inline math (OMML)", 0)
     return m

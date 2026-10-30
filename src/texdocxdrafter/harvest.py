@@ -29,6 +29,9 @@ OVERRIDES = r"""
 \AtBeginDocument{%
   \hyphenpenalty=10000 \exhyphenpenalty=10000 \sloppy \raggedright \pagestyle{empty}%
   \renewcommand{\TeX}{TeX}\renewcommand{\LaTeX}{LaTeX}\renewcommand{\LaTeXe}{LaTeX2e}%
+  \renewcommand{\footnote}[2][]{{\ttfamily @@FN@@}#2{\ttfamily @@/FN@@}}%  footnote citations (verbose styles,
+  \renewcommand{\footnotetext}[2][]{{\ttfamily @@FN@@}#2{\ttfamily @@/FN@@}}% \footcite): their text, inline
+  \renewcommand{\footnotemark}[1][]{}%
   \providecommand{\BibTeX}{}\renewcommand{\BibTeX}{BibTeX}%
   \providecommand{\bibhang}{}\setlength{\bibhang}{0pt}%
   \def\wfI{{\ttfamily @@I@@}}\def\wfEI{{\ttfamily @@/I@@}}%
@@ -202,16 +205,18 @@ def _marker(pattern: str, nonce: str) -> re.Pattern:
 
 def normalise(text: str) -> str:
     text = "".join(_LIG.get(ch, ch) for ch in text)
+    # pdftotext gives some accented i's as a dotless ı plus a combining mark: that is an i with the mark
+    text = re.sub(r"\u0131(?=[\u0300-\u036f])", "i", text)
     text = unicodedata.normalize("NFC", text)
     return xml_safe(text.replace("­", "").replace("\x0c", "\n"))
 
 
 def to_runs(s: str, nonce: str = "") -> list[Run]:
     """Marked text → runs with formats. Italic markers toggle (an \\emph inside \\emph is upright)."""
-    _TOKEN = _marker(r"@@(/?)(I|B|SUP|SUB)@@", nonce)
+    _TOKEN = _marker(r"@@(/?)(I|B|SUP|SUB|FN)@@", nonce)
     s = re.sub(r"\s+", " ", s)
     runs: list[Run] = []
-    depth = {"I": 0, "B": 0, "SUP": 0, "SUB": 0}
+    depth = {"I": 0, "B": 0, "SUP": 0, "SUB": 0, "FN": 0}
     pos = 0
 
     def emit(txt: str) -> None:
@@ -226,6 +231,8 @@ def to_runs(s: str, nonce: str = "") -> list[Run]:
             fmt.add("sup")
         if depth["SUB"] > 0:
             fmt.add("sub")
+        if depth["FN"] > 0:
+            fmt.add("fn")  # text LaTeX put in a footnote: the writer makes a Word footnote of it
         if runs and runs[-1].fmt == frozenset(fmt):
             runs[-1] = Run(runs[-1].text + txt, runs[-1].fmt)
         else:
@@ -287,14 +294,13 @@ def parse_text(text: str, expected_cites: int, bib_keys: list[tuple[int, int]], 
             runs = linkify(to_runs(etxt, nonce))
             # numeric styles print a label before the marker: it ends up in the previous chunk
             entries.append((ekey, runs))
-        # labels (e.g. "[1]") that precede the next marker are at the tail of the previous chunk; peel them off
-        fixed = []
-        for i, (ekey, runs) in enumerate(entries):
-            fixed.append((ekey, runs))
-        if lead and re.fullmatch(r"\[?\(?\d+[\]\).]?", lead) and fixed:
-            k, rs = fixed[0]
-            fixed[0] = (k, [Run(lead + " ", frozenset())] + rs)
-        res.bibs[key] = _attach_labels(fixed)
+        # labels (e.g. "[1]", "[Knu84]", "12.") print before the entry marker, so the first one is in the lead
+        # chunk and every other one trails the previous entry: move them back
+        lm = _LABEL_AT_END.search(lead) if lead else None
+        if lm and entries:
+            k, rs = entries[0]
+            entries[0] = (k, [Run(lm.group(1) + " ", frozenset())] + rs)
+        res.bibs[key] = _attach_labels(entries)
     missing = [i for i in range(expected_cites) if i not in res.cites]
     if missing:
         audit.add("harvest", f"{len(missing)} citation(s) missing from the harvest output: {missing[:10]}")
@@ -305,21 +311,26 @@ def parse_text(text: str, expected_cites: int, bib_keys: list[tuple[int, int]], 
     return res
 
 
+# a bibliography label as numeric and alphabetic styles print it: [1], [Knu84], (12), 12.  (at the end of a chunk;
+# at most three digits for the bare form, so that a year closing an entry, "2020.", is never taken for one)
+_LABEL_AT_END = re.compile(r"(?:^|\s)(\[[^\[\]\s]{1,24}\]|\([^()\s]{1,24}\)|\d{1,3}\.)\s*$")
+
+
 def _attach_labels(entries: list[tuple[str, list[Run]]]) -> list[tuple[str, list[Run]]]:
-    """Numeric labels print before the entry marker, so they trail the previous entry: move them back."""
+    """Labels print before the entry marker, so they trail the previous entry: move them back."""
     out = []
-    label_re = re.compile(r"\s*(\[\d+\]|\(\d+\)|\d+\.)\s*$")
     pending = None
-    for k, runs in entries:
+    for i, (k, runs) in enumerate(entries):
         if pending:
             runs = [Run(pending + " ", frozenset())] + runs
             pending = None
-        if runs:
+        if runs and i < len(entries) - 1:  # only when an entry follows: its label is what trails this one
             last = runs[-1]
-            m = label_re.search(last.text) if re.search(r"[\.\)\]]\s*(\[\d+\]|\(\d+\))\s*$", last.text) else None
-            if m and len(entries) > 1:
+            m = _LABEL_AT_END.search(last.text)
+            if m and not last.url:
                 pending = m.group(1)
-                runs = runs[:-1] + ([Run(last.text[:m.start()], last.fmt)] if last.text[:m.start()].strip() else [])
+                head = last.text[:m.start()].rstrip()
+                runs = runs[:-1] + ([Run(head, last.fmt)] if head else [])
         out.append((k, runs))
     return out
 

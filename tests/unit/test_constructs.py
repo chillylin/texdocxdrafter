@@ -400,3 +400,43 @@ def test_panel_letters_skip_a_plain_picture_before_the_subfigures(tmp_path):
     build(src, no_harvest=True, log=_quiet)
     paras = _paras(_xml(tmp_path))
     assert "(a) Left" in paras and "(b) Right" in paras, paras
+
+
+# ---- round 15 ---------------------------------------------------------------------------------------------
+
+
+def test_caption_star_has_no_number_and_does_not_advance_the_sequence(tmp_path):
+    """C1: \\caption* gives an unnumbered caption; the next figure is still Figure 1."""
+    src = _doc(tmp_path, r"""\begin{figure}\includegraphics{pic.png}\caption*{Unnumbered fig}\end{figure}
+\begin{figure}\includegraphics{pic.png}\caption{Real fig}\label{fig:real}\end{figure}
+\begin{table}\caption*{Loose table}\begin{tabular}{l} a \end{tabular}\end{table}
+\begin{table}\caption{Real table}\begin{tabular}{l} b \end{tabular}\end{table}
+See \ref{fig:real}.""")
+    res = build(src, no_harvest=True, log=_quiet)
+    assert res.check.ok, res.check.errors
+    paras = _paras(_xml(tmp_path))
+    assert "Unnumbered fig" in paras and "Figure 1: Real fig" in paras, paras
+    assert "Loose table" in paras and "Table 1: Real table" in paras, paras
+    assert not [p for p in paras if p.startswith("Figure 2") or p.startswith("Table 2")]
+
+
+def test_sequence_follows_latex_numbers_from_the_aux(tmp_path):
+    """C2': when LaTeX's number differs from Word's running count, the SEQ field resets the sequence."""
+    src = _doc(tmp_path, r"""\begin{figure}\includegraphics{pic.png}\caption{First}\label{fig:a}\end{figure}
+\setcounter{figure}{4}
+\begin{figure}\includegraphics{pic.png}\caption{Fifth in LaTeX}\label{fig:b}\end{figure}
+\begin{figure}\includegraphics{pic.png}\caption{Sixth}\label{fig:c}\end{figure}
+\begin{equation} a = b \label{eq:a} \end{equation}
+\begin{equation} c = d \label{eq:b} \end{equation}
+Refs \ref{fig:b}, \ref{fig:c}, \ref{eq:b}.""")
+    src.with_suffix(".aux").write_text("\\relax\n\\newlabel{fig:a}{{1}{1}}\n\\newlabel{fig:b}{{5}{1}}\n\\newlabel{fig:c}{{6}{1}}\n"
+                                       "\\newlabel{eq:a}{{1}{1}}\n\\newlabel{eq:b}{{3}{1}}\n")
+    res = build(src, no_harvest=True, log=_quiet)
+    xml = _xml(tmp_path)
+    assert "SEQ Figure \\r 5 \\* ARABIC" in xml and "SEQ Equation \\r 3 \\* ARABIC" in xml, xml[:0]
+    paras = _paras(xml)
+    assert "Figure 5: Fifth in LaTeX" in paras and "Figure 6: Sixth" in paras, paras
+    assert xml.count("SEQ Figure \\r") == 1  # the sixth follows the running count again
+    msgs = [e.message for e in res.audit.entries if e.kind == "numbering"]
+    assert any("reset to LaTeX's number" in m for m in msgs), msgs
+    assert all(e.severity == "info" for e in res.audit.entries if e.kind == "numbering"), msgs

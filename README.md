@@ -388,7 +388,12 @@ contents of table cells, citations (the harvest line gives their count), metadat
 
 ## Known limits
 
-- Appendix headings keep numeric numbering in Word (flagged in the report).
+- Appendix headings keep numeric numbering in Word (flagged in the report). Where LaTeX's figure, table or
+  equation number (from the `.aux`) is a plain integer that differs from Word's running count, after
+  `\setcounter` or `subequations` for instance, the SEQ field resets Word's sequence to LaTeX's number.
+  `\caption*` gives an unnumbered caption that does not advance the sequence.
+- Footnote citations (`\footcite`, and `\autocite` in verbose styles) become Word footnotes holding the
+  citation text as LaTeX set it; inside a footnote they are written in parentheses.
 - `\numberwithin` (per-section equation numbers) is not reproduced; Word numbers continuously.
 - A multi-line numbered `align` loses its alignment points (each numbered line is its own row);
   unnumbered `align*` keeps them.

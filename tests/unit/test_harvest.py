@@ -78,3 +78,100 @@ def test_real_harvest_multicite_logos_and_missing_key(tmp_path):
     assert "The TeXbook" in text and "LaTeX: A Document" in text and "L A TEX" not in text, text
     assert any("not found in the .bib" in e.message and "nothere" in e.message for e in res.audit.entries), \
         [e.message for e in res.audit.entries]
+
+
+# ---- round 15 ----------------------------------------------------------------------------------------------
+
+
+def test_normalise_turns_dotless_i_plus_mark_into_the_accented_i():
+    """C3: pdftotext's 'ı' + combining diaeresis is an ï."""
+    from texdocxdrafter.harvest import normalise
+
+    assert normalise("na\u0131\u0308ve Zu\u0308rich") == "naïve Zürich"
+    assert normalise("\u0131") == "\u0131"  # a real dotless ı (Turkish) without a mark stays
+
+
+def test_bibliography_labels_of_every_style_are_moved_to_their_entry():
+    """C6: [1], [Knu84], 12. labels print before the entry marker; the first sits in the lead chunk."""
+    from texdocxdrafter.audit import Audit
+    from texdocxdrafter.harvest import parse_text
+
+    for lab1, lab2, lab3 in (("[1]", "[2]", "[3]"), ("[Knu84]", "[Lam94]", "[Smi20]"), ("1.", "2.", "3.")):
+        text = (f"@@xBIB 0 0@@x {lab1} @@xENTRY knuth84@@x Knuth, The TeXbook. 1984. {lab2} @@xENTRY lamport94@@x "
+                f"Lamport, LaTeX. 1994. {lab3} @@xENTRY smith20@@x Smith. 2020. @@xENDBIB@@x")
+        res = parse_text(text, 0, [(0, 0)], Audit(), "x")
+        entries = res.bibs[(0, 0)]
+        texts = ["".join(r.text for r in runs) for _, runs in entries]
+        assert texts == [f"{lab1} Knuth, The TeXbook. 1984.", f"{lab2} Lamport, LaTeX. 1994.", f"{lab3} Smith. 2020."], texts
+
+
+VERBOSE_DOC = r"""\documentclass{article}
+\usepackage[style=verbose,backend=biber]{biblatex}
+\addbibresource{refs.bib}
+\begin{document}
+First mention\autocite[12]{knuth84} and again\autocite[14]{knuth84} and Lamport\autocite{lamport94}.
+\printbibliography
+\end{document}
+"""
+
+
+@pytest.mark.skipif(not (HAVE_TOOLS and sandbox.have_os_sandbox()), reason="pdflatex, biber, poppler or bubblewrap missing")
+def test_footnote_citations_of_a_verbose_style_become_word_footnotes(tmp_path):
+    """C4: \\autocite in a verbose style is a footnote in LaTeX; the docx gets one footnote per citation with
+    the citation text, and no literal footnote digits in the body."""
+    import re
+
+    src = tmp_path / "main.tex"
+    src.write_text(VERBOSE_DOC)
+    (tmp_path / "refs.bib").write_text(BIB)
+    for cmd in (["pdflatex", "-interaction=batchmode", "main"], ["biber", "main"], ["pdflatex", "-interaction=batchmode", "main"]):
+        subprocess.run(cmd, cwd=tmp_path, capture_output=True, timeout=120)
+    res = build(src, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    z = zipfile.ZipFile(tmp_path / "main.docx")
+    body = "".join(re.findall(r"<w:t(?: [^>]*)?>([^<]*)</w:t>", z.read("word/document.xml").decode()))
+    assert "First mention and again and Lamport." in body, body
+    fn = z.read("word/footnotes.xml").decode()
+    notes = re.findall(r'<w:footnote w:id="\d+">(.*?)</w:footnote>', fn, re.S)
+    texts = ["".join(re.findall(r"<w:t(?: [^>]*)?>([^<]*)</w:t>", n)) for n in notes]
+    assert len(texts) == 3, texts
+    assert "Knuth" in texts[0] and "TeXbook" in texts[0] and "p. 12" in texts[0], texts
+    assert "Knuth" in texts[1] and "p. 14" in texts[1] and "Lamport" in texts[2], texts
+    assert res.audit.census.get("citations in footnotes") == 3
+    assert not [e for e in res.audit.entries if e.kind == "fidelity"], [e.message for e in res.audit.entries]
+
+
+REFSECTIONS_DOC = r"""\documentclass{article}
+\usepackage[style=authoryear,backend=biber]{biblatex}
+\addbibresource{refs.bib}
+\begin{document}
+\begin{refsection}
+\section{One}
+Cite \parencite{knuth84}.
+\printbibliography[heading=subbibliography]
+\end{refsection}
+\begin{refsection}
+\section{Two}
+Cite again \parencite{knuth84} and \parencite{lamport94}.
+\printbibliography[heading=subbibliography]
+\end{refsection}
+\end{document}
+"""
+
+
+@pytest.mark.skipif(not (HAVE_TOOLS and sandbox.have_os_sandbox()), reason="pdflatex, biber, poppler or bubblewrap missing")
+def test_same_work_in_two_refsections_builds_with_linked_citations(tmp_path):
+    """C5: the entry bookmarks are per refsection, so a work in two bibliographies is no duplicate."""
+    import re
+
+    src = tmp_path / "main.tex"
+    src.write_text(REFSECTIONS_DOC)
+    (tmp_path / "refs.bib").write_text(BIB)
+    for cmd in (["pdflatex", "-interaction=batchmode", "main"], ["biber", "main"], ["pdflatex", "-interaction=batchmode", "main"]):
+        subprocess.run(cmd, cwd=tmp_path, capture_output=True, timeout=120)
+    res = build(src, link_citations=True, log=lambda *_: None)
+    assert res.check.ok, res.check.errors
+    xml = zipfile.ZipFile(tmp_path / "main.docx").read("word/document.xml").decode()
+    assert xml.count("Addison-Wesley") >= 3  # Knuth twice, Lamport once
+    anchors = re.findall(r'w:anchor="([^"]+)"', xml)
+    assert len(anchors) == 3 and len(set(anchors)) == 3, anchors  # each citation points into its own section's list

@@ -147,6 +147,7 @@ class TableMixin:
                     if isinstance(x, LatexMacroNode) and x.macroname == "caption":
                         a = macro_args(x)
                         table.caption = self.caption_inlines(a[-1]) if a else None
+                        table.unnumbered = bool(a) and a[0] is not None and getattr(a[0], "chars", "") == "*"
                         c.remove(x)
                     elif isinstance(x, LatexMacroNode) and x.macroname == "label":
                         a = macro_args(x)

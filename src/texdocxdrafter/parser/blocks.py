@@ -421,6 +421,7 @@ class BlockMixin:
             first.caption, first.short_caption, first.label = caption, seg.short, seg.label
             first.notes = notes
             first.wide = wide
+            first.unnumbered = seg.unnumbered
             for t in tables[1:]:
                 t.floating = False
             if len(tables) > 1:
@@ -435,9 +436,9 @@ class BlockMixin:
             if caption is None and not seg.label:
                 return []
             return [Figure(images=[], caption=caption, short_caption=seg.short, label=seg.label, notes=notes,
-                           wide=wide, loc=loc)]
+                           wide=wide, unnumbered=seg.unnumbered, loc=loc)]
         out.append(Figure(images=images, caption=caption, short_caption=seg.short, label=seg.label,
-                          notes=notes, wide=wide, loc=loc))
+                          notes=notes, wide=wide, unnumbered=seg.unnumbered, loc=loc))
         if tables:
             self.audit.add("table", f"{len(tables)} tabular(s) inside a {name} environment kept after the figure", loc)
             for t in tables:
@@ -457,6 +458,7 @@ class BlockMixin:
                         if acc.caption is not None:
                             acc.new_caption()  # a second caption: the content so far gets its own block
                         acc.caption = self.caption_inlines(a[-1])
+                        acc.unnumbered = nm == "caption" and a[0] is not None and getattr(a[0], "chars", "") == "*"
                         acc.at_caption = (len(acc.tables), len(acc.images))
                         if len(a) > 1 and a[1] is not None and nm == "caption":
                             acc.short = self.caption_inlines(a[1])
@@ -580,9 +582,10 @@ class _Marker(LatexMacroNode):
 class FloatSegment:
     """One captioned block of a float: its caption, labels and content."""
 
-    def __init__(self, caption, short, label, extra_labels, tables, images):
+    def __init__(self, caption, short, label, extra_labels, tables, images, unnumbered=False):
         self.caption, self.short, self.label = caption, short, label
         self.extra_labels, self.tables, self.images = extra_labels, tables, images
+        self.unnumbered = unnumbered
 
 
 class FloatAcc:
@@ -599,9 +602,11 @@ class FloatAcc:
         self.size = None  # last font-size declaration, applied to tikzpicture renders
         self.segments: list = []  # finished FloatSegments (a float with several captions)
         self.at_caption = (0, 0)  # how many tables and images had been seen when the current caption arrived
+        self.unnumbered = False  # the current caption is \\caption*
 
     def segment(self) -> FloatSegment:
-        return FloatSegment(self.caption, self.short, self.label, self.extra_labels, self.tables, self.images)
+        return FloatSegment(self.caption, self.short, self.label, self.extra_labels, self.tables, self.images,
+                            self.unnumbered)
 
     def new_caption(self) -> None:
         """A second \\caption: close the segment of the first. A caption that followed content owns that content;
@@ -609,13 +614,14 @@ class FloatAcc:
         nt, ni = self.at_caption
         if nt + ni > 0:  # caption below its content: the content before it is its own, the rest moves on
             self.segments.append(FloatSegment(self.caption, self.short, self.label, self.extra_labels,
-                                              self.tables[:nt], self.images[:ni]))
+                                              self.tables[:nt], self.images[:ni], self.unnumbered))
             self.tables, self.images = self.tables[nt:], self.images[ni:]
         else:  # caption above its content: everything so far is its own
             self.segments.append(self.segment())
             self.tables, self.images = [], []
         self.caption = self.short = self.label = None
         self.extra_labels = []
+        self.unnumbered = False
 
 
 LatexChars = LatexCharsNode
