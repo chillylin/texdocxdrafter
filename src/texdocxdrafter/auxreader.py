@@ -33,9 +33,10 @@ MAX_DEPTH = 10
 
 
 def read_aux(path: Path | None, roots: list[Path] | None = None, _seen: set | None = None,
-             _depth: int = 0) -> dict[str, AuxLabel]:
-    """Labels of an .aux file and the .aux files it ``\\@input``s, which must lie under ``roots`` (if given)."""
-    from .preflight import inside
+             _depth: int = 0, issues: list[str] | None = None) -> dict[str, AuxLabel]:
+    """Labels of an .aux file and the .aux files it ``\\@input``s, which must lie under ``roots`` (if given).
+    Decoding problems are appended to ``issues`` when given."""
+    from .preflight import inside, read_source_text
 
     labels: dict[str, AuxLabel] = {}
     if path is None or _depth > MAX_DEPTH:
@@ -50,7 +51,7 @@ def read_aux(path: Path | None, roots: list[Path] | None = None, _seen: set | No
     if path in seen:
         return labels
     seen.add(path)
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in read_source_text(path, issues if issues is not None else []).splitlines():
         m = re.match(r"\\newlabel\{([^}]*)\}\{(.*)\}\s*$", line)
         if m:
             key, rest = m.group(1), m.group(2)
@@ -74,7 +75,7 @@ def read_aux(path: Path | None, roots: list[Path] | None = None, _seen: set | No
         im = re.match(r"\\@input\{([^}]*)\}", line)
         if im:
             sub = path.parent / im.group(1)
-            for k, v in read_aux(sub, roots, seen, _depth + 1).items():
+            for k, v in read_aux(sub, roots, seen, _depth + 1, issues).items():
                 labels.setdefault(k, v)
     return labels
 

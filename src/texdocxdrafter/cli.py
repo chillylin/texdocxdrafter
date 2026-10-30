@@ -20,7 +20,7 @@ def _preflight(args, need_build_files=True):
 
 
 def cmd_build(args) -> int:
-    from .pipeline import build
+    from .pipeline import OutputValidationError, build
     from .preflight import PreflightError
     from .refdoc import TemplateError
     from .stylemap import StyleMapError
@@ -29,10 +29,14 @@ def cmd_build(args) -> int:
         res = build(args.main, out=args.output, style_map=args.style_map, reference_doc=args.reference_doc,
                     link_citations=args.link_citations, keep_work=args.keep_work, no_harvest=args.no_harvest,
                     no_tikz=args.no_tikz, validate_lo=args.validate_libreoffice, comments=args.comments,
-                    overwrite=args.overwrite, allow_dirs=args.allow_dir or (), timeout=args.timeout)
+                    overwrite=args.overwrite, allow_dirs=args.allow_dir or (), timeout=args.timeout,
+                    strict=args.strict)
     except (PreflightError, TemplateError, StyleMapError) as exc:
         print(f"texdocxdrafter: {exc}", file=sys.stderr)
         return 2
+    except OutputValidationError as exc:
+        print(f"texdocxdrafter: {exc}", file=sys.stderr)
+        return 1
     warn = len(res.audit.warnings())
     print(f"wrote {res.out}")
     print(f"report {res.report} ({warn} items need attention)")
@@ -181,6 +185,8 @@ def main(argv=None) -> int:
     b.add_argument("--timeout", type=_timeout, default=120, metavar="SECONDS",
                    help=f"limit per TeX/biber run (default 120, at most {MAX_TIMEOUT})")
     b.add_argument("--validate-libreoffice", action="store_true")
+    b.add_argument("--strict", action="store_true",
+                   help="also fail (and write nothing) when the word-count or content check finds a loss")
     b.set_defaults(fn=cmd_build)
 
     i = sub.add_parser("inventory", help="construct census and stylemap.yaml skeleton")

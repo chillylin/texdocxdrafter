@@ -1310,7 +1310,9 @@ def test_libreoffice_validation_runs_sandboxed(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox, "run", run)
     src = _write(tmp_path)
     res = build(src, no_harvest=True, validate_lo=True, log=lambda *_: None)
-    assert seen["rw"] and seen["ro"] == [tmp_path] and seen["env"]["HOME"] == str(seen["rw"][0])
+    # LibreOffice reads the private candidate in the work directory, never the output directory itself
+    assert seen["rw"] and seen["env"]["HOME"] == str(seen["rw"][0])
+    assert len(seen["ro"]) == 1 and seen["ro"][0].name.startswith("texdocxdrafter-") and seen["ro"][0] != tmp_path
     assert any(a.startswith("-env:UserInstallation=file://") for a in seen["cmd"])
     assert any("inside the sandbox" in e.message for e in res.audit.entries)
 

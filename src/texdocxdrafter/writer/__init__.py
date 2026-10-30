@@ -20,6 +20,7 @@ from ..parser.model import (
     Link, ListBlock, PageBreak, Para, Quote, RawBlock, RawInline, Ref, Revision, RevisionBlock, Styled, Table, Text,
     Verbatim,
 )
+from ..preflight import fingerprint
 from ..refdoc import build_reference
 from . import images as gfx
 from . import math as omml
@@ -691,6 +692,7 @@ class DocxWriter:
             self.audit.add("figure", f"graphic '{img.name}' not found", img.loc)
             self.add(para(self.ps("figure"), [run(f"[missing figure: {img.name}]", self.cs("todo"))]))
             return
+        fingerprint(self.pf, path)  # the build refuses to publish if the file changes before the end
         ras = gfx.to_raster(path, self.pf.workdir / "images")
         if ras is None:
             self.audit.add("figure", f"graphic '{path.name}' could not be converted", img.loc)

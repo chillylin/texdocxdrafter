@@ -85,7 +85,10 @@ def resolve(doc: Document, pf, audit: Audit, harvest=None) -> Resolved:
     from .auxreader import read_aux
     from .harvest import apply_harvest
 
-    aux = read_aux(pf.aux, [pf.srcdir] + list(pf.allow_dirs))
+    issues: list[str] = []
+    aux = read_aux(pf.aux, [pf.srcdir] + list(pf.allow_dirs), issues=issues)
+    for issue in issues:
+        audit.add("label", issue)
     labels = collect_labels(doc, aux, audit)
     check_refs(doc, labels, audit)
     ok = False

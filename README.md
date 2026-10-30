@@ -156,6 +156,7 @@ and citations and the reference list are read from that file.
 | `--allow-dir DIR` | Also accept `\input`, `\include` and graphics from `DIR` (repeatable). By default only files under the directory of `main.tex` are read |
 | `--timeout SECONDS` | Limit for each TeX or biber run of the side compiles (default 120, at most 3600) |
 | `--validate-libreoffice` | Also try to open the result with headless LibreOffice, if installed. It runs in the same sandbox as the TeX engines with a private profile; a snap-packaged LibreOffice cannot start there and is reported as such |
+| `--strict` | Write nothing when the word-count check or the content check finds a loss (by default both are reported, and only structural validation and the policy check are fatal) |
 
 With `--no-harvest --no-tikz` the tool only parses; the same is true for BibTeX documents without TikZ.
 
@@ -311,12 +312,28 @@ reads only regular files there, never through a symbolic link, and creates its o
   a symbolic link.
   Nothing else next to your sources is created, changed or deleted. The docx is written to a temporary name
   and renamed into place, so an interrupted run never leaves a half-written file.
+- Nothing is published before it is checked. The docx is validated on a private copy in the work directory:
+  it must be a readable package whose XML is well formed, whose styles, relationships, bookmarks and numbering
+  resolve, and whose children sit in schema order; and the whole package is checked against the
+  active-content policy below (every relationship, content type, part and field, wherever it sits). An error
+  there ends the run with a message and the existing output, report and registry are untouched. The
+  word-count check and the content check are reported in the same way but are fatal only with `--strict`.
+  Every input (sources, `.aux`, `.bbl`, `.bib`, graphics) is hashed when it is read and checked again right
+  before publication: if one changed meanwhile, nothing is written and the message names it.
 - The output and the report are never source files or symbolic links. The tool records a hash of every file
   it writes in `main.texdocxdrafter/outputs.json`; an existing file whose hash does not match, that is, any
   file it did not write or that has been changed since, is not overwritten without `--overwrite`. Files are
   written through an exclusively created temporary file and renamed into place, and the target is checked
-  again at that moment: a file that appeared or changed while the conversion ran is left alone. A file at the
+  again at that moment: a file that appeared or changed while the conversion ran is left alone. The report,
+  the docx and the registry are committed as one step, in that order; if one of the three fails (disk full,
+  permissions), the ones already written are put back to their previous content. What a sequence of renames
+  cannot promise: a crash between two of the three leaves them inconsistent (the next run will say so), the
+  moment between the last identity check of the target and its rename remains open to a concurrent save by
+  another program, and the directory is `fsync`ed after the rename only where the platform allows it, so
+  durability across a power loss is best effort. A file at the
   registry's path that is not a registry this tool wrote, or that is one of your sources, stops the run.
+- Source files must be UTF-8. Bytes that are not are replaced by U+FFFD and the report names the file and the
+  offset of the first one; the files themselves are never modified.
 - A reference document is used for its styles, numbering, page setup, headers and footers only. Its comments
   and people list, footnotes and endnotes, glossary, custom XML, custom and extended properties, thumbnail,
   every core property, attached-template path and document variables are removed first, so nothing of the
@@ -357,8 +374,11 @@ reads only regular files there, never through a symbolic link, and creates its o
 `main.texdocxdrafter-report.md` contains the run summary, style usage, construct census, and sections for
 unsupported constructs, dropped presentation commands, direct formatting, math that stayed as LaTeX text,
 missing figures, harvest problems (for example cited keys missing from the `.bib`), numbering
-differences between LaTeX and Word, and a word-count check that warns when more than 2 % of the source
-words are missing from the docx.
+differences between LaTeX and Word, a word-count check that warns when more than 2 % of the source
+words are missing from the docx, and a content check that compares the parsed document with the finished
+file: every heading in order and with its text, and the number of tables, embedded pictures, equations,
+footnotes and bibliography entries. The content check does not compare the order of body paragraphs, the
+contents of table cells, citations (the harvest line gives their count), metadata or formatting.
 
 ## Known limits
 

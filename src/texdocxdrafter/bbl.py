@@ -464,7 +464,12 @@ def harvest_from_bbl(pf: Preflight, doc: Document, audit: Audit):
         audit.add("harvest", f"{pf.bbl.name if pf.bbl else 'the .bbl'} is missing: run bibtex on {pf.main.name} first; "
                              "citations rendered as [key]")
         return res
-    entries = parse_bbl(pf.bbl.read_text(encoding="utf-8", errors="replace"))
+    from .preflight import read_source_text
+
+    issues: list[str] = []
+    entries = parse_bbl(read_source_text(pf.bbl, issues))
+    for issue in issues:
+        audit.add("harvest", issue)
     if not entries:
         audit.add("harvest", f"no \\bibitem entries found in {pf.bbl.name}; citations rendered as [key]")
         return res

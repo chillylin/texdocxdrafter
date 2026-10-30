@@ -6,6 +6,7 @@ The flattened text carries a source map, so every parsed node can be traced back
 from __future__ import annotations
 
 import bisect
+import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,6 +72,7 @@ class Preflight:
     two_column: bool = False
     allow_dirs: list[Path] = field(default_factory=list)  # directories besides srcdir that \input/graphics may use
     issues: list[str] = field(default_factory=list)
+    fingerprints: dict[str, str] = field(default_factory=dict)  # sha256 of every input as it was when read
 
     @property
     def uses_biblatex(self) -> bool:
@@ -124,6 +126,52 @@ def _strip_comment(line: str) -> tuple[str, bool]:
             return line[:i], True
         i += 1
     return line, False
+
+
+def read_source_text(path: Path, issues: list[str], shown: str | None = None) -> str:
+    """A user-authored file (.tex, .bbl, .aux) as text. UTF-8 is required; bytes that are not UTF-8 are replaced
+    by U+FFFD and reported in ``issues`` with the file and the offset of the first one, so the loss is never
+    silent (the bytes on disk are of course untouched)."""
+    data = path.read_bytes()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        text = data.decode("utf-8", errors="replace")
+        n = text.count("\ufffd") - data.decode("utf-8", errors="ignore").count("\ufffd")
+        issues.append(f"{shown or path.name}: {n} byte sequence(s) are not valid UTF-8 (first at byte {exc.start}); "
+                      "they appear as \ufffd in the docx. Save the file as UTF-8 to fix this")
+        return text
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fingerprint(pf: "Preflight", path: Path) -> None:
+    """Remember what an input file looked like when it was read (first sight wins), for ``changed_inputs``."""
+    key = str(path)
+    if key not in pf.fingerprints:
+        try:
+            pf.fingerprints[key] = _sha256_file(path)
+        except OSError:
+            pass
+
+
+def changed_inputs(pf: "Preflight") -> list[str]:
+    """The inputs whose content differs from when they were read: sources, build files, graphics."""
+    out = []
+    for key, digest in pf.fingerprints.items():
+        try:
+            now = _sha256_file(Path(key))
+        except OSError:
+            now = None
+        if now != digest:
+            out.append(key)
+    return out
 
 
 def inside(path: Path, roots: list[Path]) -> bool:
@@ -211,7 +259,7 @@ def _flatten_file(path: Path, srcdir: Path, stack: tuple[Path, ...], issues: lis
     if budget is None:
         budget = {"files": 0, "chars": 0, "noted": False}
     try:
-        text_all = path.read_text(encoding="utf-8", errors="replace")
+        text_all = read_source_text(path, issues, shown)
     except OSError as exc:
         issues.append(f"cannot read {path}: {exc}")
         return pieces
@@ -383,7 +431,7 @@ def preflight(main: str | Path, need_build_files: bool = True, allow_dirs=()) ->
     body_start = m.end()
     body = text[body_start: end if end > body_start else len(text)]
 
-    raw_main = main.read_text(encoding="utf-8", errors="replace")
+    raw_main = read_source_text(main, [])  # already reported by _flatten_file
     rm = re.search(r"\\begin\{document\}", raw_main)
     orig_preamble = raw_main[: rm.start()] if rm else preamble
 
@@ -433,4 +481,12 @@ def preflight(main: str | Path, need_build_files: bool = True, allow_dirs=()) ->
             raise PreflightError(f"{pf.aux.name} is missing: compile {main.name} first (latex + biber)")
         if pf.uses_biblatex and not pf.bbl.is_file():
             raise PreflightError(f"{pf.bbl.name} is missing: run biber on {main.name} first")
+    # what every input looks like now; the build refuses to publish if any of them changes meanwhile
+    for f in [main] + [srcdir / f for f, _ in source.origins] + [pf.aux, pf.bbl, pf.bcf]:
+        if f.is_file():
+            fingerprint(pf, f)
+    for name in pf.bib_resources:
+        for cand in (srcdir / name, srcdir / (name + ".bib")):
+            if cand.is_file():
+                fingerprint(pf, cand)
     return pf

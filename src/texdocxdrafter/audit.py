@@ -20,6 +20,7 @@ KINDS = {
     "table": "Tables",
     "style": "Style map",
     "words": "Word-count check",
+    "fidelity": "Content check (tree against docx)",
     "preflight": "Preflight",
     "other": "Other",
 }

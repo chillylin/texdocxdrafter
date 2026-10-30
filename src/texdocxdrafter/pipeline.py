@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import stat
 import shutil
 import tempfile
 import time
@@ -17,6 +18,7 @@ from pathlib import Path
 from lxml import etree
 from pylatexenc.latex2text import LatexNodes2Text
 
+from . import fidelity
 from . import harvest as harvest_mod
 from . import sandbox
 from . import stylemap as stylemap_mod
@@ -24,7 +26,7 @@ from . import tikz as tikz_mod
 from .audit import Audit
 from .parser import parse_document
 from .parser.model import to_json
-from .preflight import Preflight, PreflightError, preflight
+from .preflight import Preflight, PreflightError, changed_inputs, preflight
 from .resolve import resolve
 from .sidecompile import SideDir
 from .validate import CheckResult, check_docx
@@ -46,6 +48,14 @@ class BuildResult:
     audit: Audit
     check: CheckResult
     report: Path
+
+
+class OutputValidationError(RuntimeError):
+    """The docx the writer produced failed validation; nothing was published."""
+
+
+class SourceChangedError(PreflightError):
+    """An input changed while the document was being converted; nothing was published."""
 
 
 _LAYOUT = [
@@ -221,9 +231,13 @@ class Registry:
     def record(self, path) -> None:
         self.data[str(path)] = _sha256(Path(path))
 
-    def save(self) -> None:
+    def staged(self) -> tuple:
+        """The registry as a ``publish`` item: (path, bytes, snapshot, what)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        commit_file(self.path, json.dumps(self.data, indent=1).encode("utf-8"), self.snapshot, "hash registry")
+        return (self.path, json.dumps(self.data, indent=1).encode("utf-8"), self.snapshot, "hash registry")
+
+    def save(self) -> None:
+        publish([self.staged()])
         self.snapshot = _sha256(self.path)
 
 
@@ -236,6 +250,20 @@ def _is_own_output(path: Path, reg: dict) -> bool:
 def _snapshot(path: Path) -> str | None:
     """sha256 of the vetted target as it is now, or None when it does not exist (so the commit must create it)."""
     return _sha256(path) if path.is_file() else None
+
+
+def _fsync_dir(path: Path) -> None:
+    """Make the directory entry durable after a rename, where the platform allows it (best effort)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _write_tmp(path: Path, data: bytes) -> str:
@@ -259,14 +287,21 @@ def write_atomic(path: Path, data: bytes) -> None:
     except BaseException:
         os.unlink(tmp)
         raise
+    _fsync_dir(path.parent)
+
+
+def _identity(st: os.stat_result) -> tuple:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def commit_file(path: Path, data: bytes, snapshot: str | None, what: str = "file") -> None:
     """Write ``data`` to a target vetted earlier, refusing if the target changed meanwhile.
 
     ``snapshot`` is what ``_snapshot`` returned at vetting time. None: the target did not exist, so it is
-    created exclusively and anything that appeared since is left alone. Otherwise the current content must
-    still hash to ``snapshot`` right before it is replaced."""
+    created exclusively and anything that appeared since is left alone. Otherwise the file at the target is
+    opened (never through a symbolic link), its content must still hash to ``snapshot``, and its identity
+    (device, inode, size, times) is compared once more right before the rename. What remains is the gap
+    between that comparison and the rename itself; a path-based replace cannot close it entirely."""
     tmp = _write_tmp(path, data)
     try:
         if snapshot is None:
@@ -279,12 +314,34 @@ def commit_file(path: Path, data: bytes, snapshot: str | None, what: str = "file
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
                 with os.fdopen(fd, "wb") as f:
                     f.write(data)
+            _fsync_dir(path.parent)
             return
-        if path.is_symlink() or not path.is_file() or _sha256(path) != snapshot:
-            raise PreflightError(f"{what} {path} was changed by something else while the document was being "
+        changed = PreflightError(f"{what} {path} was changed by something else while the document was being "
                                  "converted; not touching it (rerun to replace it if it is yours)")
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            raise changed
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise changed
+            h = hashlib.sha256()
+            for chunk in iter(lambda: os.read(fd, 1 << 20), b""):
+                h.update(chunk)
+        finally:
+            os.close(fd)
+        if h.hexdigest() != snapshot:
+            raise changed
+        try:
+            now = os.stat(path, follow_symlinks=False)
+        except OSError:
+            raise changed
+        if _identity(now) != _identity(st):
+            raise changed
         os.replace(tmp, path)
         tmp = None
+        _fsync_dir(path.parent)
     finally:
         if tmp is not None:
             try:
@@ -293,14 +350,46 @@ def commit_file(path: Path, data: bytes, snapshot: str | None, what: str = "file
                 pass
 
 
+def publish(items: list[tuple]) -> None:
+    """Commit several files as one step: ``items`` are (path, data, snapshot, what) as for ``commit_file``.
+
+    If any commit fails, the files already written are put back: a replaced file gets its previous content,
+    a created file is removed. The three files of a build (report, docx, registry) therefore change together
+    or not at all, as far as a sequence of renames allows; a crash between two of them is the residual."""
+    done: list[tuple[Path, bytes | None]] = []
+    try:
+        for path, data, snapshot, what in items:
+            previous = path.read_bytes() if snapshot is not None else None
+            commit_file(path, data, snapshot, what)
+            done.append((path, previous))
+    except BaseException:
+        for path, previous in reversed(done):
+            try:
+                if previous is None:
+                    os.unlink(path)
+                else:
+                    write_atomic(path, previous)
+            except OSError:
+                pass
+        raise
+
+
 def _source_files(pf: Preflight) -> set[Path]:
     return {pf.main.resolve()} | {(pf.srcdir / f).resolve() for f, _ in pf.source.origins if (pf.srcdir / f).exists()}
 
 
+def _samefile(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def vet_target(path: Path, what: str, pf: Preflight, reg: dict, overwrite: bool) -> Path:
     """Refuse a target that is a source file, a symlink, a directory, or an existing file this tool did not write."""
-    if path.resolve() in _source_files(pf):
-        raise PreflightError(f"{what} {path.name} is one of the source files")
+    sources = _source_files(pf)
+    if path.resolve() in sources or (path.exists() and any(_samefile(path, src) for src in sources)):
+        raise PreflightError(f"{what} {path.name} is one of the source files")  # also a hard link to one
     if path.is_symlink():
         raise PreflightError(f"{what} {path} is a symbolic link; refusing to write through it")
     if path.exists():
@@ -340,7 +429,12 @@ def _keep_work(run_dir: Path, config_dir: Path, log) -> Path:
 
 def build(main, out=None, style_map=None, reference_doc=None, link_citations=False, keep_work=False,
           no_harvest=False, no_tikz=False, validate_lo=False, comments=False, overwrite=False, allow_dirs=(),
-          timeout=sandbox.COMPILE_TIMEOUT, log=print) -> BuildResult:
+          timeout=sandbox.COMPILE_TIMEOUT, strict=False, log=print) -> BuildResult:
+    """Convert ``main`` and publish the docx, its report and the hash registry.
+
+    Nothing is published before the docx passed structural validation and the policy check (an error there
+    raises OutputValidationError), and before every input is confirmed unchanged since it was read
+    (SourceChangedError). The word-count and content checks are reported; with ``strict`` they are fatal too."""
     t0 = time.time()
     audit = Audit()
     for what in sandbox.limit_self():  # also when build() is called as a library, not through the CLI
@@ -406,19 +500,37 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
         writer = DocxWriter(res, pf, sm, audit, template=reference_doc, link_citations=link_citations)
         buf = io.BytesIO()
         writer.write(buf, comments=comments)
-        commit_file(out, buf.getvalue(), snaps[out], "output")  # exclusive temp file; refuses if the target changed since vetting
-        reg[str(out)] = _sha256(out)
-        chk = check_docx(out)
+        data = buf.getvalue()
+        # everything is checked on a private copy in the work directory; the target is not touched until all passed
+        candidate = run_dir / out.name
+        sandbox.write_fresh(candidate, data)
+        try:
+            chk = check_docx(candidate)
+        except Exception as exc:  # not even a readable package
+            raise OutputValidationError(f"{out.name} could not be validated ({exc}); nothing was written")
         for e in chk.errors:
             audit.add("other", f"validation: {e}")
-        word_loss(pf, out, audit)
+        pct = word_loss(pf, candidate, audit)
+        mismatches = fidelity.check(doc, candidate, sm, audit)
         if validate_lo:
-            _libreoffice(out, audit)
+            _libreoffice(candidate, audit)
+        if chk.errors:
+            raise OutputValidationError(f"{out.name} failed validation ({len(chk.errors)} error(s): "
+                                        f"{'; '.join(chk.errors[:3])}); nothing was written")
+        if strict and (pct > 2.0 or mismatches):
+            raise OutputValidationError("--strict: " + "; ".join(([f"word loss {pct:.1f}%"] if pct > 2.0 else []) + mismatches)
+                                        + "; nothing was written")
+        changed = changed_inputs(pf)
+        if changed:
+            raise SourceChangedError(f"{', '.join(Path(c).name for c in changed[:3])} changed while the document was "
+                                     "being converted; nothing was written (rerun)")
         audit.info["elapsed"] = f"{time.time() - t0:.1f} s"
-        commit_file(report, audit.render(pf.main.name, stylemap=sm, style_usage=dict(chk.paragraph_styles)).encode("utf-8"),
-                    snaps[report], "report")
-        reg[str(report)] = _sha256(report)
-        registry.save()
+        report_text = audit.render(pf.main.name, stylemap=sm, style_usage=dict(chk.paragraph_styles)).encode("utf-8")
+        reg[str(report)] = hashlib.sha256(report_text).hexdigest()
+        reg[str(out)] = hashlib.sha256(data).hexdigest()
+        # report, docx, registry as one step: on a failure the ones already written are put back
+        publish([(report, report_text, snaps[report], "report"), (out, data, snaps[out], "output"), registry.staged()])
+        registry.snapshot = _sha256(registry.path)
     finally:
         pf.workdir = config_dir
         if keep_work:
@@ -447,7 +559,7 @@ def _libreoffice(out: Path, audit: Audit) -> None:
         env = dict(os.environ, HOME=str(tmp))
         r = sandbox.run([exe, f"-env:UserInstallation=file://{tmp}/profile", "--headless", "--convert-to", "pdf",
                          "--outdir", str(tmp), str(out)], cwd=tmp, env=env, timeout=300, rw=[tmp], ro=[out.parent])
-        ok = r.returncode == 0 and (tmp / (out.stem + ".pdf")).is_file()
+        ok = r.returncode == 0 and (tmp / (out.stem + ".pdf")).is_file()  # ``out`` may be the private candidate
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     audit.add("other", "LibreOffice opened and converted the file" if ok else

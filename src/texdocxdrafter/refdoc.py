@@ -129,8 +129,7 @@ def build_reference(sm: dict, template: str | Path | None = None, audit: Audit |
     for child in list(body):
         if child.tag != qn("w:sectPr"):
             body.remove(child)
-    if user:
-        _scrub_template(doc)
+    _scrub_template(doc)  # the built-in template too: python-docx's default carries a customXml part
 
     paragraph_names = {v for k, v in sm["paragraph"].items() if k != "heading"} | {f"{sm['paragraph']['heading']} {i}" for i in range(1, 10)}
     char_names = set(sm["character"].values())
