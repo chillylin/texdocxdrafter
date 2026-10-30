@@ -28,6 +28,8 @@ OVERRIDES = r"""
 \makeatletter
 \AtBeginDocument{%
   \hyphenpenalty=10000 \exhyphenpenalty=10000 \sloppy \raggedright \pagestyle{empty}%
+  \renewcommand{\TeX}{TeX}\renewcommand{\LaTeX}{LaTeX}\renewcommand{\LaTeXe}{LaTeX2e}%
+  \providecommand{\BibTeX}{}\renewcommand{\BibTeX}{BibTeX}%
   \providecommand{\bibhang}{}\setlength{\bibhang}{0pt}%
   \def\wfI{{\ttfamily @@I@@}}\def\wfEI{{\ttfamily @@/I@@}}%
   \def\wfB{{\ttfamily @@B@@}}\def\wfEB{{\ttfamily @@/B@@}}%
@@ -119,7 +121,9 @@ def build_harvest_tex(pf: Preflight, doc: Document, nonce: str = "") -> tuple[st
             out.append("\\begin{refsection}")
         for c in (c for c in cites if c.section == s):
             raw = foot_to_plain(c.raw)
-            out.append("{\\ttfamily @@CITE %d@@} %s{\\ttfamily @@END@@}\\par" % (c.index, raw))
+            # \\relax ends the argument list of biblatex's \\cites, \\parencites, ...: without it the marker group
+            # that follows would be read as one more citation
+            out.append("{\\ttfamily @@CITE %d@@} %s\\relax{\\ttfamily @@END@@}\\par" % (c.index, raw))
         for k, b in enumerate([b for b in bibs if b.section == s]):
             out.append("{\\ttfamily @@BIB %d %d@@}\\par" % (s, k))
             out.append("\\bibliography{%s}" % b.bibtex if b.bibtex is not None
@@ -164,9 +168,9 @@ def compile_harvest(pf: Preflight, tex: str, audit: Audit, timeout: int = sandbo
         tex_run()
     # whatever the document left in work is untrusted: regular files only, never through a symbolic link
     text = sandbox.read_untrusted_text(work / "harvest.log")
-    if text:
-        missing = sorted(set(re.findall(r"didn't find a database entry for '([^']*)'", text)
-                             + re.findall(r"Citation `([^']*)' (?:on page \S+ )?undefined", text)))
+    blg = sandbox.read_untrusted_text(work / "harvest.blg") if (work / "harvest.blg").exists() else ""
+    if text or blg:
+        missing = missing_keys(text, blg)
         if missing:
             audit.add("harvest", f"{len(missing)} cited key(s) not found in the .bib files "
                       f"(shown as keys): {', '.join(missing[:12])}")
@@ -178,6 +182,14 @@ def compile_harvest(pf: Preflight, tex: str, audit: Audit, timeout: int = sandbo
         audit.add("harvest", f"harvest compile failed ({engine}): {'; '.join(errs) or r.stderr[:200]}")
         return None
     return pdf
+
+
+def missing_keys(log: str, blg: str = "") -> list[str]:
+    """Cited keys with no entry, from the engine log (LaTeX writes ``Citation 'key'`` with a straight quote since
+    2021, older runs with a backtick) and from biber's own log (``harvest.blg``)."""
+    found = set(re.findall(r"didn't find a database entry for '([^']*)'", log + "\n" + blg))
+    found.update(re.findall(r"Citation [`']([^']*)' (?:on (?:input line|page) \S+ )?undefined", log))
+    return sorted(found)
 
 
 _LIG = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ﬅ": "st", "ﬆ": "st"}
@@ -240,6 +252,9 @@ def linkify(runs: list[Run]) -> list[Run]:
     out: list[Run] = []
     url_re = re.compile(r"(https?://[^\s<>]+[^\s<>.,;:)\]])")
     for r in runs:
+        if r.url:  # a target from \\href, \\doi or \\url: keep it
+            out.append(r)
+            continue
         pos = 0
         for m in url_re.finditer(r.text):
             if m.start() > pos:

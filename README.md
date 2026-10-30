@@ -399,6 +399,9 @@ contents of table cells, citations (the harvest line gives their count), metadat
   (reported). A `longtable` footer repeated on every page (`\endfoot`) is dropped (reported); the closing rows
   (`\endlastfoot`) follow the body. `\multirow{-n}` is merged upwards only into empty cells of the same
   width; otherwise its text stays in its own cell (reported), so nothing above it is ever overwritten.
+- In a BibTeX document the `.bbl` is read directly: `\url`, `\href` and `\doi` become links, natbib's year
+  compression (`2020a,b`) is reproduced, and a macro the reader does not know keeps only its argument text
+  (reported). In a biblatex harvest `\LaTeX` and `\TeX` are written as plain words.
 - A float with several `\caption`s gives one captioned table or figure per caption; tabulars inside a figure
   (or pictures inside a table) follow the main block.
 - Verify the result in Word at least once per document: open it, update fields, and insert a section

@@ -109,3 +109,54 @@ def test_style_from_preamble():
     # natbib loaded but the .bst produced no author-year labels: numeric
     plain = parse_bbl(r"\begin{thebibliography}{9}\bibitem{a} A.\end{thebibliography}")
     assert cite_style(_PF([("natbib", "")]), plain).mode == "numbers"
+
+
+# ---- round 14: the .bbl reader on escapes, links, logos and natbib's year compression ----------------------
+
+BBL2 = r"""\begin{thebibliography}{9}
+\providecommand{\natexlab}[1]{#1}
+\bibitem[Smith(2020{\natexlab{a}})]{s20a} J.~Smith. A 10\% improvement in widget yield. 2020a. % a .bbl comment
+\bibitem[Smith(2020{\natexlab{b}})]{s20b} J.~Smith. The \TeX book and \href{https://ex.com/a\%20b}{the page}. 2020b. \doi{10.1/x} \url{https://ex.com/c\_d?x=1\&y=2\%20e}
+\bibitem[Jones(2019)]{j19} K.~Jones. \mkbibemph{Thing}. \foo{Kept} \LaTeX\ and \BibTeX.
+\end{thebibliography}
+"""
+
+
+def test_escaped_percent_is_text_and_comments_still_go():
+    r"""B1: \% stayed as text; the real comment after it is gone."""
+    es = parse_bbl(BBL2)
+    assert _text(render(es[0].body)) == "J. Smith. A 10% improvement in widget yield. 2020a."
+
+
+def test_url_href_and_doi_targets_from_the_bbl():
+    r"""B3, B4: targets lose their TeX escapes, \href links its text, \doi links; linkify keeps those targets."""
+    from texdocxdrafter.harvest import linkify
+
+    es = parse_bbl(BBL2)
+    runs = linkify(render(es[1].body))
+    assert _text(runs) == "J. Smith. The TeXbook and the page. 2020b. doi:10.1/x https://ex.com/c_d?x=1&y=2%20e"
+    assert [(r.text, r.url) for r in runs if r.url] == [
+        ("the page", "https://ex.com/a%20b"), ("doi:10.1/x", "https://doi.org/10.1/x"),
+        ("https://ex.com/c_d?x=1&y=2%20e", "https://ex.com/c_d?x=1&y=2%20e")]
+
+
+def test_logos_and_unknown_macros():
+    r"""B6: \TeX and friends are words; a macro the reader does not know keeps its argument and is counted."""
+    from texdocxdrafter import bbl as bbl_mod
+
+    bbl_mod.UNKNOWN.clear()
+    es = parse_bbl(BBL2)
+    runs = render(es[2].body)
+    assert _text(runs) == "K. Jones. Thing. Kept LaTeX and BibTeX."
+    assert [r.text for r in runs if "i" in r.fmt] == ["Thing"]
+    assert dict(bbl_mod.UNKNOWN) == {"foo": 1}
+
+
+def test_natbib_compresses_years_of_one_author():
+    """B7: natbib prints 2020a,b, not 2020a, 2020b."""
+    by = {e.key: e for e in parse_bbl(BBL2)}
+    st = CiteStyle()
+    assert _text(render_cite(r"\citep{s20a,s20b,j19}", by, st)) == "(Smith, 2020a,b; Jones, 2019)"
+    assert _text(render_cite(r"\citet{s20a,s20b}", by, st)) == "Smith (2020a,b)"
+    by2 = {e.key: e for e in parse_bbl(BBL)}
+    assert _text(render_cite(r"\citep{smith2020a,smith2021}", by2, st)) == "(Smith et al., 2020a, 2021)"

@@ -14,6 +14,7 @@ post-notes, the ``round``/``square``/``curly``/``angle``, ``comma``/``semicolon`
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 
 from pylatexenc.latex2text import LatexNodes2Text
@@ -86,7 +87,9 @@ def _balanced(text: str, pos: int, open_: str, close: str) -> tuple[str, int]:
 
 
 def parse_bbl(text: str) -> list[Entry]:
-    text = re.sub(r"%.*", "", text)  # comments
+    from .preflight import _strip_comment  # an escaped \\% and a % inside \\url{} are text, not a comment
+
+    text = "\n".join(_strip_comment(line)[0] for line in text.split("\n"))
     m = re.search(r"\\begin\{thebibliography\}\s*\{[^}]*\}", text)
     start = m.end() if m else 0
     end = text.find("\\end{thebibliography}", start)
@@ -141,16 +144,18 @@ _L2T = LatexNodes2Text(math_mode="text", keep_comments=False)
 _CONTEXT = get_default_latex_context_db()
 _CONTEXT.add_context_category("bbl", prepend=True, macros=[
     MacroSpec("doi", "{"), MacroSpec("bibinfo", "{{"), MacroSpec("natexlab", "{"), MacroSpec("noopsort", "{"),
-    MacroSpec("mkbibquote", "{"), MacroSpec("enquote", "{"), MacroSpec("urlprefix", ""), MacroSpec("BIBand", ""),
+    MacroSpec("mkbibquote", "{"), MacroSpec("enquote", "{"), MacroSpec("mkbibemph", "{"), MacroSpec("mkbibitalic", "{"), MacroSpec("mkbibbold", "{"), MacroSpec("urlprefix", ""), MacroSpec("BIBand", ""),
     MacroSpec("newblock", ""), MacroSpec("textsuperscript", "{"), MacroSpec("textsubscript", "{"),
     MacroSpec("textendash", ""), MacroSpec("textemdash", ""), MacroSpec("bibAnnoteFile", "{"),
     MacroSpec("textsl", "{"), MacroSpec("textmd", "{"), MacroSpec("textup", "{"), MacroSpec("textnormal", "{"),
+    MacroSpec("href", "{{"), MacroSpec("TeX", ""), MacroSpec("LaTeX", ""), MacroSpec("LaTeXe", ""), MacroSpec("BibTeX", ""),
 ])
+UNKNOWN: Counter = Counter()  # macros the renderer did not know, per render of a bibliography (reported by the caller)
 _ITALIC_SWITCH = {"em", "it", "itshape", "sl", "slshape"}
 _BOLD_SWITCH = {"bf", "bfseries"}
 _PLAIN_SWITCH = {"rm", "rmfamily", "normalfont", "upshape", "mdseries", "sc", "scshape", "sf", "sffamily", "tt", "ttfamily"}
-_ITALIC_MACROS = {"emph", "textit", "textsl"}
-_BOLD_MACROS = {"textbf"}
+_ITALIC_MACROS = {"emph", "textit", "textsl", "mkbibemph", "mkbibitalic"}
+_BOLD_MACROS = {"textbf", "mkbibbold"}
 _TRANSPARENT = {"mbox", "hbox", "textsc", "textrm", "textup", "textnormal", "texttt", "textsf", "natexlab", "mkbibquote",
                 "bibinfo", "enquote", "protect", "noopsort", "textmd"}
 _DROP = {"newblock", "relax", "penalty", "break", "nobreak", "sloppy", "fussy", "hskip", "vskip", "hfill", "hfil",
@@ -158,7 +163,16 @@ _DROP = {"newblock", "relax", "penalty", "break", "nobreak", "sloppy", "fussy", 
          "urlstyle", "bibitem", "newline", "linebreak", "nolinebreak"}
 _WORDS = {"BIBand": "and", "urlprefix": "URL ", "ldots": "…", "dots": "…", "textellipsis": "…", "&": "&", "%": "%",
           "_": "_", "$": "$", "#": "#", "{": "{", "}": "}", "textendash": "–", "textemdash": "—", " ": " ", ",": "",
-          "/": "", "-": "", "@": ""}
+          "/": "", "-": "", "@": "", "TeX": "TeX", "LaTeX": "LaTeX", "LaTeXe": "LaTeX2e", "BibTeX": "BibTeX"}
+
+
+def _url_text(nodes_or_text) -> str:
+    """A url as written: without its braces and without the backslashes that protect % _ # & $ ~ in TeX."""
+    u = nodes_or_text if isinstance(nodes_or_text, str) else "".join(x.latex_verbatim() for x in nodes_or_text)
+    u = u.strip()
+    if u[:1] == "{" and u[-1:] == "}":
+        u = u[1:-1]
+    return re.sub(r"\\([%_#&$~{}])", r"\1", u).strip()
 
 
 def _arg_nodes(node: LatexMacroNode, k: int = -1) -> list:
@@ -226,13 +240,12 @@ def to_runs(nodes: list, fmt: frozenset = frozenset()) -> list[Run]:
                 for r in to_runs(_arg_nodes(n), frozenset(cur)):
                     emit(r.text, set(r.fmt), r.url)
             elif name in ("url", "path"):
-                u = n.latex_verbatim()
-                u = re.sub(r"^\\\w+\s*", "", u).strip()
-                u = u[1:-1] if u[:1] == "{" else u
-                emit(u, cur, u if u.startswith(("http", "ftp")) else None)
+                u = _url_text(re.sub(r"^\\\w+\s*", "", n.latex_verbatim()))
+                emit(u, cur, u if u.startswith(("http://", "https://", "ftp://")) else None)
             elif name == "href":
-                u = _text(_arg_nodes(n, 0)).strip()
-                emit(_text(_arg_nodes(n, -1)), cur, u)
+                u = _url_text(_arg_nodes(n, 0))
+                for r in to_runs(_arg_nodes(n, -1), frozenset(cur)):
+                    emit(r.text, set(r.fmt), u if u.startswith(("http://", "https://", "ftp://")) else None)
             elif name == "doi":
                 d = _text(_arg_nodes(n)).strip()
                 emit("doi:" + d, cur, "https://doi.org/" + d)
@@ -243,6 +256,8 @@ def to_runs(nodes: list, fmt: frozenset = frozenset()) -> list[Run]:
             elif name in _DROP:
                 continue
             else:
+                if name.isalpha() and _L2T.latex_context.get_macro_spec(name) is None:
+                    UNKNOWN[name] += 1  # latex2text keeps the argument text of a macro it does not know, nothing else
                 emit(_L2T.node_to_text(n), cur)
     return out
 
@@ -426,7 +441,18 @@ def render_cite(raw: str, by_key: dict[str, Entry], st: CiteStyle) -> list[Run] 
             groups.append((author, [e.year]))
 
     def years(ys: list[str]) -> str:
-        return (st.yysep + " ").join(ys)
+        """natbib joins the years of one author with yysep and shortens a repeated year to its letter: 2020a,b."""
+        out = ""
+        for i, y in enumerate(ys):
+            m = re.match(r"^(\d{4})([a-z])$", y or "")
+            prev = re.match(r"^(\d{4})([a-z])$", ys[i - 1] or "") if i else None
+            if i == 0:
+                out = y
+            elif m and prev and m.group(1) == prev.group(1):
+                out += st.yysep + m.group(2)
+            else:
+                out += st.yysep + " " + y
+        return out
 
     if base in ("citet", "cite"):
         parts = [f"{a} {st.open}{years(ys)}{st.close}" for a, ys in groups]
@@ -488,12 +514,16 @@ def harvest_from_bbl(pf: Preflight, doc: Document, audit: Audit):
                              f"{', '.join(sorted(missing)[:12])}")
     numbered = st.mode in ("numbers", "super") or not st.natbib
     rendered = []
+    UNKNOWN.clear()
     for e in entries:
         runs = linkify(render(e.body))
         if numbered:
             label = plain(e.label) if (e.label is not None and not st.natbib) else str(e.number)
             runs = [Run(f"[{label}] ", frozenset())] + runs
         rendered.append((e.key, runs))
+    if UNKNOWN:
+        audit.add("harvest", f"{pf.bbl.name}: macro(s) the .bbl reader does not know, only their argument text is "
+                             "kept: " + ", ".join(f"\\{k} ({v})" for k, v in UNKNOWN.most_common(10)))
     counts: dict[int, int] = {}
 
     def collect(n):
