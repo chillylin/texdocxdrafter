@@ -58,6 +58,8 @@ Pure Python plus your existing TeX installation. No pandoc, no LibreOffice, no J
 
 ## Install
 
+Released on PyPI as [`texdocxdrafter`](https://pypi.org/project/texdocxdrafter/) (Python 3.12 or later):
+
 ```
 pip install texdocxdrafter
 ```
@@ -69,8 +71,7 @@ pipx install texdocxdrafter
 ```
 
 This installs the `texdocxdrafter` command (also runnable as `python -m texdocxdrafter.cli`).
-The name is `tex` + `docx` + `drafter`; `pip install tex-docx-drafter` resolves to the same package.
-To work on the code itself, see Development at the end.
+The name is `tex` + `docx` + `drafter`, written as one word. To work on the code itself, see Development at the end.
 
 ## Before you run it
 
