@@ -167,6 +167,7 @@ def test_failed_rollback_is_reported_not_swallowed(tmp_path, monkeypatch):
     assert "b.txt" not in str(info.value).split("could not be put back")[0]  # R7: only the files not restored are named
 
 
+@pytest.mark.skipif(os.name != "posix", reason="file modes are POSIX only")
 def test_published_files_follow_the_umask_and_keep_their_mode(tmp_path, monkeypatch):
     old = os.umask(0o022)
     try:

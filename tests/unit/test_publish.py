@@ -278,3 +278,18 @@ def test_hard_link_to_a_source_is_refused_as_output(tmp_path):
     with pytest.raises(pipeline.PreflightError, match="is one of the source files"):
         build(src, no_harvest=True, overwrite=True, log=_quiet)
     assert src.read_bytes() == before and out.read_bytes() == before
+
+
+def test_target_open_in_another_program_gets_a_plain_message(tmp_path, monkeypatch):
+    """Windows refuses to replace a file Word holds open: say so instead of a traceback, and leave it alone."""
+    target = tmp_path / "t.docx"
+    target.write_bytes(b"old")
+
+    def locked(src, dst):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(pipeline.os, "replace", locked)
+    with pytest.raises(pipeline.PreflightError, match="open in another program"):
+        pipeline.commit_file(target, b"new", pipeline._snapshot(target), "output")
+    assert target.read_bytes() == b"old"
+    _no_temp_files(tmp_path)

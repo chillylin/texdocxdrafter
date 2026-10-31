@@ -304,12 +304,21 @@ def _mode_of(path: Path) -> int | None:
     return stat.S_IMODE(st.st_mode) if stat.S_ISREG(st.st_mode) else None
 
 
+def _replace(tmp: str, path: Path, what: str = "file") -> None:
+    """os.replace, with a plain message where Windows refuses to replace a file another program holds open."""
+    try:
+        os.replace(tmp, path)
+    except PermissionError as exc:
+        raise PreflightError(f"cannot replace {what} {path} ({exc.strerror or exc}); if it is open in another "
+                             "program such as Word, close it and rerun") from exc
+
+
 def write_atomic(path: Path, data: bytes) -> None:
     """Write ``data`` to ``path`` through an exclusively created temporary file in the same directory; an existing
     file keeps its mode."""
     tmp = _write_tmp(path, data, _mode_of(path))
     try:
-        os.replace(tmp, path)
+        _replace(tmp, path)
     except BaseException:
         os.unlink(tmp)
         raise
@@ -343,7 +352,7 @@ def commit_file(path: Path, data: bytes, snapshot: str | None, what: str = "file
                 except FileExistsError:
                     raise appeared
                 try:
-                    os.replace(tmp, path)  # the data was written to tmp already: never a half-written target
+                    _replace(tmp, path, what)  # the data was written to tmp already: never a half-written target
                     tmp = None
                 except BaseException:
                     try:
@@ -380,7 +389,7 @@ def commit_file(path: Path, data: bytes, snapshot: str | None, what: str = "file
             raise changed
         if _identity(now) != _identity(st):
             raise changed
-        os.replace(tmp, path)
+        _replace(tmp, path, what)
         tmp = None
         _fsync_dir(path.parent)
     finally:

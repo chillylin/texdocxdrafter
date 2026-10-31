@@ -2,6 +2,8 @@
 image cache keys and tool limits."""
 import os
 import shutil
+import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -68,7 +70,7 @@ x
 
 def test_timeout_is_enforced():
     t0 = time.time()
-    r = sandbox.run(["sleep", "5"], cwd="/tmp", timeout=1)
+    r = sandbox.run([sys.executable, "-c", "import time; time.sleep(5)"], cwd=tempfile.gettempdir(), timeout=1)
     assert r.returncode == -1 and "timed out" in r.stderr
     assert time.time() - t0 < 4
 
@@ -414,7 +416,8 @@ def test_figure_names_with_dots_convert(tmp_path):
 
 
 def test_timeout_partial_output_is_text():
-    r = sandbox.run(["sh", "-c", "echo partial; sleep 5"], cwd="/tmp", timeout=1)
+    code = "import time; print('partial', flush=True); time.sleep(5)"
+    r = sandbox.run([sys.executable, "-c", code], cwd=tempfile.gettempdir(), timeout=1)
     assert r.returncode == -1 and isinstance(r.stdout, str) and "partial" in r.stdout
 
 
@@ -551,10 +554,10 @@ def test_reference_doc_comments_do_not_leak(tmp_path):
     src = _write(tmp_path)
     out = tmp_path / "main.docx"
     build(src, reference_doc=tpl, no_harvest=True, log=lambda *_: None)
-    z = zipfile.ZipFile(out)
-    assert "word/comments.xml" not in z.namelist()
-    assert all(b"PRIVATE-TEMPLATE-NOTE" not in z.read(n) for n in z.namelist())
-    assert all(b"Reviewer" not in z.read(n) for n in z.namelist() if n.startswith("word/"))
+    with zipfile.ZipFile(out) as z:  # closed before the rebuild: Windows cannot replace an open file
+        assert "word/comments.xml" not in z.namelist()
+        assert all(b"PRIVATE-TEMPLATE-NOTE" not in z.read(n) for n in z.namelist())
+        assert all(b"Reviewer" not in z.read(n) for n in z.namelist() if n.startswith("word/"))
 
     build(src, reference_doc=tpl, no_harvest=True, comments=True, log=lambda *_: None)
     z = zipfile.ZipFile(out)
@@ -1138,6 +1141,9 @@ def test_reference_doc_header_fields_that_fetch_content_are_removed(tmp_path):
 def _bounded(fn, seconds=90):
     import signal
 
+    if not hasattr(signal, "SIGALRM"):
+        pytest.skip("no SIGALRM on this platform")
+
     def alarm(*_):
         raise AssertionError(f"did not finish within {seconds} s")
 
@@ -1182,6 +1188,7 @@ def test_deep_nesting_is_an_error_not_a_traceback(tmp_path, capsys):
     assert not (tmp_path / "main.docx").exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="resource limits are POSIX only")
 def test_tool_process_has_memory_and_cpu_limits():
     import subprocess
     import sys
