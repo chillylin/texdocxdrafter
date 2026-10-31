@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  push:
+    branches: ["**"]  # tags are tested by publish.yml, which calls this workflow
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # On Linux the compile, harvest and sandbox tests need TeX, biber, poppler and bubblewrap; elsewhere they skip.
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap poppler-utils biber \
+            texlive-latex-base texlive-latex-recommended texlive-latex-extra texlive-luatex \
+            texlive-bibtex-extra texlive-pictures texlive-fonts-recommended
+          # Ubuntu 24.04 confines unprivileged user namespaces, which bubblewrap needs
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - run: pip install -e ".[dev]" pytest-github-actions-annotate-failures
+
+      - run: pytest
