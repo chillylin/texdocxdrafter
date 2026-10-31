@@ -250,18 +250,19 @@ def test_commit_refuses_a_target_swapped_at_the_last_moment(tmp_path, monkeypatc
     target = tmp_path / "t.docx"
     target.write_bytes(b"old")
     snap = pipeline._snapshot(target)
-    real_stat = os.stat
+    real_open = pipeline.sandbox.open_nofollow
+    opens = []
 
     def swapped(path, *a, **k):
-        st = real_stat(path, *a, **k)
-        if Path(path) == target:  # another program saved the file between the hash check and the rename
-            fresh = tmp_path / "editor-save"
-            fresh.write_bytes(b"old")
-            os.replace(fresh, target)  # same content, new inode
-            return real_stat(path, *a, **k)
-        return st
+        if Path(path) == target:
+            opens.append(path)
+            if len(opens) == 2:  # another program saved the file between the hash check and the rename
+                fresh = tmp_path / "editor-save"
+                fresh.write_bytes(b"old")
+                os.replace(fresh, target)  # same content, new inode
+        return real_open(path, *a, **k)
 
-    monkeypatch.setattr(pipeline.os, "stat", swapped)
+    monkeypatch.setattr(pipeline.sandbox, "open_nofollow", swapped)
     with pytest.raises(pipeline.PreflightError, match="changed by something else"):
         pipeline.commit_file(target, b"new", snap, "output")
     assert target.read_bytes() == b"old"

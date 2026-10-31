@@ -370,8 +370,12 @@ def commit_file(path: Path, data: bytes, snapshot: str | None, what: str = "file
             os.close(fd)
         if h.hexdigest() != snapshot:
             raise changed
-        try:
-            now = os.stat(path, follow_symlinks=False)
+        try:  # fstat again, not stat: on Windows the two disagree on st_dev and st_ino for the same file
+            fd = sandbox.open_nofollow(path, os.O_RDONLY)
+            try:
+                now = os.fstat(fd)
+            finally:
+                os.close(fd)
         except OSError:
             raise changed
         if _identity(now) != _identity(st):
