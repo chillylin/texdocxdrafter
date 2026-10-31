@@ -339,7 +339,7 @@ def commit_file(path: Path, data: bytes, snapshot: str | None, what: str = "file
                 raise appeared
             except OSError:  # hard links unsupported (FAT, some shares): reserve the name exclusively, then rename
                 try:
-                    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+                    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | sandbox.O_BINARY, 0o644))
                 except FileExistsError:
                     raise appeared
                 try:
@@ -356,7 +356,7 @@ def commit_file(path: Path, data: bytes, snapshot: str | None, what: str = "file
         changed = PreflightError(f"{what} {path} was changed by something else while the document was being "
                                  "converted; not touching it (rerun to replace it if it is yours)")
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            fd = sandbox.open_nofollow(path, os.O_RDONLY)
         except OSError:
             raise changed
         try:

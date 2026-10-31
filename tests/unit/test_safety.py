@@ -978,6 +978,21 @@ def test_work_dir_helpers_never_follow_a_symlink(tmp_path):
     assert secret.exists() and victim.exists()  # the symlinked directory's content was not removed
 
 
+def test_work_dir_helpers_without_o_nofollow(tmp_path, monkeypatch):
+    """Windows has neither O_NOFOLLOW nor O_CLOEXEC: the helpers still work and still refuse a symlink."""
+    monkeypatch.setattr(sandbox, "O_NOFOLLOW", 0)
+    monkeypatch.setattr(sandbox, "O_CLOEXEC", 0)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOPSECRET")
+    (tmp_path / "log.txt").symlink_to(secret)
+    assert sandbox.read_untrusted(tmp_path / "log.txt") is None
+    data = bytes(range(256)) * 4  # every byte value, CR and LF included, must survive unchanged
+    sandbox.write_fresh(tmp_path / "out.bin", data)
+    assert sandbox.read_untrusted(tmp_path / "out.bin") == data
+    write_atomic(tmp_path / "out.bin", data[::-1])
+    assert (tmp_path / "out.bin").read_bytes() == data[::-1]
+
+
 def _fake_compile(plant):
     """A compile_tex stand-in: the 'document' leaves whatever ``plant(work)`` creates, and reports success."""
     import subprocess

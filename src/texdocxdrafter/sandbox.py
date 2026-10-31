@@ -295,8 +295,24 @@ package.preload["debug"] = nil
 # nor redirect a write outside the work directory.
 
 
+# Flags for os.open that some platforms lack. Windows has no O_NOFOLLOW or O_CLOEXEC (O_NOINHERIT is its
+# equivalent of the latter) and opens in text mode unless O_BINARY is given, which would rewrite every
+# newline byte of a docx. Where O_NOFOLLOW is missing, the callers check with lstat before opening.
+O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+O_CLOEXEC = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOINHERIT", 0)
+O_BINARY = getattr(os, "O_BINARY", 0)
+
+
 class UntrustedPathError(OSError):
     """A path in a work directory is not a regular file (a symbolic link, a directory, a device)."""
+
+
+def open_nofollow(path: Path | str, flags: int, mode: int = 0o777) -> int:
+    """os.open that refuses a symbolic link at ``path``: by O_NOFOLLOW where the platform has it, else by lstat
+    first (a narrower guarantee, but Windows needs privilege to create a symbolic link anyway)."""
+    if not O_NOFOLLOW and os.path.islink(path):
+        raise UntrustedPathError(f"{path} is a symbolic link")
+    return os.open(path, flags | O_NOFOLLOW | O_CLOEXEC | O_BINARY, mode)
 
 
 def is_plain_file(path: Path | str) -> bool:
@@ -309,7 +325,7 @@ def is_plain_file(path: Path | str) -> bool:
 def read_untrusted(path: Path | str, limit: int = MAX_FILE_BYTES) -> bytes | None:
     """Bytes of a regular file written by a child process; None when absent or not a regular file."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, "O_NOCTTY", 0))
+        fd = open_nofollow(path, os.O_RDONLY | getattr(os, "O_NOCTTY", 0))
     except OSError:
         return None
     try:
@@ -333,7 +349,7 @@ def write_fresh(path: Path | str, data: bytes | str) -> None:
         if path.is_dir() and not path.is_symlink():
             raise UntrustedPathError(f"{path} is a directory")
         path.unlink()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    fd = open_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     with os.fdopen(fd, "wb") as f:
         f.write(data.encode("utf-8") if isinstance(data, str) else data)
 
