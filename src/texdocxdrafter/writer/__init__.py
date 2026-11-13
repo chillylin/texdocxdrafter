@@ -18,9 +18,10 @@ from ..audit import Audit
 from ..parser.model import (
     Bibliography, Cell, Cite, DisplayMath, Document, Figure, Footnote, Heading, InlineMath, Label, LineBreak,
     Link, ListBlock, PageBreak, Para, Quote, RawBlock, RawInline, Ref, Revision, RevisionBlock, Styled, Table, Text,
-    Verbatim,
+    Verbatim, walk_tree,
 )
 from ..preflight import fingerprint
+from ..parser.blocks import heading_unit
 from ..refdoc import build_reference
 from . import images as gfx
 from . import math as omml
@@ -37,7 +38,12 @@ REF_WORDS = {  # (autoref/cref word singular, plural) by kind
     "table": ("table", "tables"), "figure": ("figure", "figures"), "subfigure": ("figure", "figures"),
     "equation": ("equation", "equations"), "item": ("item", "items"), "para": ("paragraph", "paragraphs"),
 }
-SECTION_WORDS = {1: "section", 2: "subsection", 3: "subsubsection", 4: "paragraph", 5: "subparagraph"}
+# cleveref's default English names by counter type: subsections are "section", appendix levels "appendix"
+CREF_SECTION = {"part": ("part", "parts"), "chapter": ("chapter", "chapters"), "section": ("section", "sections"),
+                "subsection": ("section", "sections"), "subsubsection": ("section", "sections"),
+                "paragraph": ("paragraph", "paragraphs"), "subparagraph": ("paragraph", "paragraphs"),
+                "appendix": ("appendix", "appendices"), "subappendix": ("appendix", "appendices"),
+                "subsubappendix": ("appendix", "appendices")}
 FOOT_CITES = {"footcite", "footcitetext", "footfullcite", "footcites"}
 
 
@@ -74,6 +80,16 @@ def _parenthesised(els: list, space: str) -> list:
     return [run(space + "(")] + list(els) + [run(")")]
 
 
+def _conjunction(i: int, n: int) -> str:
+    """The separator before the ``i``-th of ``n`` items of a reference list."""
+    return " and " if (i == n - 1 and n == 2) else (", and " if i == n - 1 else ", ")
+
+
+def _letter(n: int) -> str:
+    """Word's upperLetter format: A..Z, then AA..ZZ, AAA.."""
+    return chr(ord("A") + (n - 1) % 26) * ((n - 1) // 26 + 1)
+
+
 class DocxWriter:
     def __init__(self, resolved, pf, sm: dict, audit: Audit, template=None, link_citations: bool = False):
         self.res = resolved
@@ -83,7 +99,9 @@ class DocxWriter:
         self.sm = sm
         self.audit = audit
         self.link_citations = link_citations
-        self.d, self.nm, self.refinfo = build_reference(sm, template, audit)
+        app = self.doc.appendix_level
+        self.d, self.nm, self.refinfo = build_reference(
+            sm, template, audit, None if app is None else (app, self.doc.appendix_prefix or ""))
         self.body = self.d.element.body
         self.sect = self.body.find(q("w:sectPr"))
         self.sid = {s.name: s.style_id for s in self.d.styles}
@@ -98,6 +116,9 @@ class DocxWriter:
         self.used = Counter()
         self.last_was_table = False
         self.heading_count = Counter()
+        opts = next((o for n, o in pf.packages if n == "cleveref"), "")
+        self.cref_capitalise = bool(re.search(r"\bcapitali[sz]e\b", opts or ""))
+        self._letters: dict | None = None  # appendix chapter label -> letter, computed on first use
         self.rev_stack: list[str] = []
         cols = self.sm["options"].get("columns", "auto")
         self.columns = (2 if pf.two_column else 1) if cols == "auto" else int(cols)
@@ -320,34 +341,92 @@ class DocxWriter:
         word_mode = r.cmd in ("cref", "Cref", "autoref", "vref")
         if r.cmd == "eqref":
             out.append(run("(", None))
-        if word_mode and infos and infos[0] is not None:
-            out.append(self.text_run(self.ref_word(r, infos), flags))
-            out.append(self.text_run(" ", flags))
-        for i, (k, info) in enumerate(zip(keys, infos)):
-            if i > 0:
-                sep = " and " if (i == len(keys) - 1 and len(keys) == 2) else (", and " if i == len(keys) - 1 else ", ")
-                out.append(self.text_run(sep if word_mode or r.cmd != "eqref" else ", ", flags))
-            if info is None:
-                out.append(run("??", self.cs("todo")))
-                continue
-            out.extend(self.one_ref(r.cmd, info))
+        # cleveref names each run of same-type labels once: "section 1 and appendix A"
+        groups: list[list] = []
+        for k, info in zip(keys, infos):
+            g = self.ref_word(r, [info]) if word_mode and info is not None else None
+            if groups and (info is None or groups[-1][0] == g):  # an undefined label stays in the run
+                groups[-1][1].append((k, info))
+            else:
+                groups.append([g, [(k, info)]])
+        if not word_mode:
+            groups = [[None, list(zip(keys, infos))]]
+        for gi, (g, items) in enumerate(groups):
+            if gi > 0:
+                out.append(self.text_run(_conjunction(gi, len(groups)), flags))
+            if g is not None:
+                out.append(self.text_run(self.ref_word(r, [x for _, x in items]), flags))
+                out.append(self.text_run(" ", flags))
+            for i, (k, info) in enumerate(items):
+                if i > 0:
+                    sep = _conjunction(i, len(items))
+                    out.append(self.text_run(sep if word_mode or r.cmd != "eqref" else ", ", flags))
+                if info is None:
+                    out.append(run("??", self.cs("todo")))
+                    continue
+                out.extend(self.one_ref(r.cmd, info))
         if r.cmd == "eqref":
             out.append(run(")", None))
         return out
+
+    def section_type(self, info) -> tuple[str, str]:
+        """(cleveref type, sectioning command) of a section label. The type is the command, or for a heading
+        after \\appendix at or below the lettered level appendix, subappendix, subsubappendix. Inside the appendix
+        package's appendices environment cleveref keeps the command's type ("section A")."""
+        unit = heading_unit(info.level, self.doc.docclass, self.sm["options"].get("heading_offset", "auto"))
+        if info.appendix and not info.appendix_env and self.in_appendix(True, info.level):
+            depth = info.level - self.doc.appendix_level
+            if depth < 3:
+                return "sub" * depth + "appendix", unit
+        return unit, unit
 
     def ref_word(self, r: Ref, infos) -> str:
         first = infos[0]
         plural = len(infos) > 1
         if first.kind == "section":
-            w = SECTION_WORDS.get(first.level, "section")
-            word = w + ("s" if plural else "")
+            kind, unit = self.section_type(first)
+            if r.cmd == "autoref":  # hyperref: \\<command>autorefname; \\appendixautorefname for the top appendix level
+                if first.appendix and self.in_appendix(True, first.level) and first.level == self.doc.appendix_level:
+                    word = "appendices" if plural else "appendix"
+                else:
+                    word = unit + "s" if plural else unit
+            else:
+                sg, pl = CREF_SECTION.get(kind, ("section", "sections"))
+                word = pl if plural else sg
         else:
             sg, pl = REF_WORDS.get(first.kind, ("item", "items"))
             word = pl if plural else sg
-        if r.cmd == "Cref" or (r.cmd == "autoref" and first.kind not in ("equation", "section")) or \
-                (r.cmd == "autoref" and first.kind == "section" and first.level == 1):
+        capital = r.cmd == "Cref" or (r.cmd in ("cref", "vref") and self.cref_capitalise)
+        if capital or (r.cmd == "autoref" and first.kind not in ("equation", "section")) or \
+                (r.cmd == "autoref" and first.kind == "section" and (first.level == 1 or "appendix" in word)):
             word = word[:1].upper() + word[1:]
         return word
+
+    def in_appendix(self, appendix: bool, level: int) -> bool:
+        """A heading in the appendix at or below the lettered level takes the appendix heading styles."""
+        top = self.doc.appendix_level
+        return appendix and top is not None and level >= top
+
+    def appendix_letter(self, key: str) -> str:
+        """Without an .aux: the letter Word gives the appendix chapter labelled ``key``, counted in the tree."""
+        if self._letters is None:
+            self._letters = {}
+            count = [0]
+
+            def visit(n):
+                if isinstance(n, Heading) and n.appendix and not n.starred and n.level == self.doc.appendix_level:
+                    count[0] += 1
+                    if n.label:
+                        self._letters[n.label] = _letter(count[0])
+            walk_tree(self.doc, visit)
+        return self._letters.get(key, "?")
+
+    def number_ref(self, info, cached: str) -> list:
+        """REF \\n to a numbered heading. Word's paragraph number of an appendix chapter includes the list's
+        "Appendix " prefix, which the text around \\ref already says: that one is written as LaTeX's number."""
+        if info.appendix and self.doc.appendix_prefix and info.level == self.doc.appendix_level:
+            return [run(cached if cached != "?" else self.appendix_letter(info.key))]
+        return field(f"REF {self.label_bm(info.key)} \\n \\h", cached)
 
     def one_ref(self, cmd: str, info) -> list:
         bm = self.label_bm(info.key)
@@ -361,8 +440,10 @@ class DocxWriter:
             head = self.labels.get(info.heading) if info.heading else None
             if head is None or (head.number and info.number and head.number != info.number):
                 return [run(cached)]
-            return field(f"REF {self.label_bm(head.key)} \\n \\h", cached)
-        sw = {"section": "\\n ", "item": "\\n "}.get(info.kind, "")
+            return self.number_ref(head, cached)
+        if info.kind == "section":
+            return self.number_ref(info, cached)
+        sw = {"item": "\\n "}.get(info.kind, "")
         return field(f"REF {bm} {sw}\\h", cached)
 
     # ---- math --------------------------------------------------------------------------------
@@ -518,7 +599,12 @@ class DocxWriter:
         self.add(para(self.ps(key), kids, ppr_extra))
 
     def write_heading(self, h: Heading, style_key: str | None = None) -> None:
-        name = f"{self.sm['paragraph']['heading']} {h.level}" if style_key is None else self.sm["paragraph"][style_key]
+        if style_key is not None:
+            name = self.sm["paragraph"][style_key]
+        elif self.in_appendix(h.appendix, h.level):
+            name = f"{self.sm['paragraph']['appendix_heading']} {h.level}"
+        else:
+            name = f"{self.sm['paragraph']['heading']} {h.level}"
         kids = self.inl(h.children)
         if h.label:
             kids = self.bookmark(self.label_bm(h.label), kids)

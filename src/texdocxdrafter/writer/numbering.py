@@ -10,10 +10,12 @@ SYMBOL_FONT = {"•": "Symbol", "◦": "Courier New", "▪": "Wingdings"}
 
 
 def _lvl(ilvl: int, fmt: str, text: str, left: int, hanging: int, pstyle: str | None = None,
-         bold: bool = False, font: str | None = None, start: int = 1):
+         bold: bool = False, font: str | None = None, start: int = 1, suff: str | None = None):
     kids = [el("w:start", {"w:val": start}), el("w:numFmt", {"w:val": fmt})]
     if pstyle:
         kids.append(el("w:pStyle", {"w:val": pstyle}))
+    if suff:
+        kids.append(el("w:suff", {"w:val": suff}))
     kids.append(el("w:lvlText", {"w:val": text}))
     kids.append(el("w:lvlJc", {"w:val": "left"}))
     kids.append(el("w:pPr", None, el("w:ind", {"w:left": left, "w:hanging": hanging})))
@@ -52,6 +54,20 @@ class NumberingManager:
         for i in range(9):
             text = ".".join(f"%{k + 1}" for k in range(i + 1))
             out.append(_lvl(i, "decimal", text, 432 + 144 * i, 432 + 144 * i, pstyle=f"Heading{i + 1}"))
+        return out
+
+    @staticmethod
+    def _appendix_levels(top: int, prefix: str, pstyles: dict):
+        """Heading outline for the appendix: level ``top`` (1-based) lettered, so A, A.1, A.1.1; ``prefix``
+        ("Appendix ") goes before the letter of that level only. ``pstyles`` maps ilvl -> linked style id."""
+        out = []
+        for i in range(9):
+            fmt = "upperLetter" if i == top - 1 else "decimal"
+            text = ".".join(f"%{k + 1}" for k in range(i + 1))
+            suff = None
+            if i == top - 1 and prefix:
+                text, suff = prefix + text, "space"
+            out.append(_lvl(i, fmt, text, 432 + 144 * i, 432 + 144 * i, pstyle=pstyles.get(i), suff=suff))
         return out
 
     @staticmethod
@@ -99,6 +115,10 @@ class NumberingManager:
                     levels.append(_lvl(i, "decimal", f"%{i + 1}.", 720 + 360 * i, 360))
             self._cache[key] = self._add_abstract(levels)
         return self.add_num(self._cache[key], restart=True)
+
+    def appendix_num(self, top: int, prefix: str, pstyles: dict) -> int:
+        """A lettered heading list of its own, used by the appendix heading styles."""
+        return self.add_num(self._add_abstract(self._appendix_levels(top, prefix, pstyles)))
 
     def bullet_num(self) -> int:
         return self.BULLET_NUM

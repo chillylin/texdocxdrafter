@@ -26,6 +26,8 @@ TABULARS = {"tabular", "tabular*", "tabularx", "tabulary", "longtable", "array_"
 PAGE_BREAKS = {"newpage", "clearpage", "cleardoublepage", "pagebreak"}
 LIST_ENVS = {"itemize", "enumerate", "description"}
 TIKZ_ENVS = {"tikzpicture"}
+BOOK_CLASSES = {"report", "book", "memoir", "scrreprt", "scrbook"}  # \\chapter is the top numbered unit
+PREFIX_CLASSES = {"report", "book", "memoir"}  # their appendix chapters read "Appendix A"; KOMA's read "A"
 SIZES = {"tiny", "scriptsize", "footnotesize", "small", "normalsize", "large", "Large", "LARGE", "huge", "Huge"}
 
 
@@ -60,10 +62,37 @@ class Flow:
         return any(not (isinstance(x, Text) and not x.text.strip()) for x in self.cur)
 
 
+UNITS = ("chapter", "section", "subsection", "subsubsection", "paragraph", "subparagraph", "part")
+
+
+def heading_level(name: str, docclass: str, offset) -> int:
+    """The Word heading level of a LaTeX sectioning command."""
+    book = docclass in BOOK_CLASSES
+    base = {"part": 1, "chapter": 1, "section": 2, "subsection": 3, "subsubsection": 4,
+            "paragraph": 5, "subparagraph": 6}[name]
+    if not book and offset == "auto":
+        base -= 1
+        if name == "part":
+            base = 1
+    elif isinstance(offset, int):
+        base += offset
+    return max(1, min(base, 9))
+
+
+def heading_unit(level: int, docclass: str, offset) -> str:
+    """The sectioning command behind a Word heading level (the inverse of ``heading_level``)."""
+    book = docclass in BOOK_CLASSES
+    for name in UNITS:
+        if (name != "chapter" or book) and heading_level(name, docclass, offset) == level:
+            return name
+    return "section"
+
+
 class BlockMixin:
     list_depth = 0
     refsection = 0
     appendix = False
+    appendix_env = False
 
     # ---------------------------------------------------------------------------------------
     def blocks(self, nodes, style: str | None = None) -> list:
@@ -149,9 +178,7 @@ class BlockMixin:
             return 0
         if name == "appendix":
             ctx.flush()
-            self.appendix = True
-            self.audit.add("numbering", "\\appendix: Word headings keep numeric numbering; "
-                           "appendix letters need a manual fix", loc, "warn")
+            self.start_appendix(loc)
             return 0
         if name == "printbibliography":
             ctx.flush()
@@ -227,9 +254,12 @@ class BlockMixin:
             ctx.flush()
         elif name == "appendices":
             ctx.flush()
-            self.appendix = True
+            before = self.appendix, self.appendix_env
+            self.start_appendix(loc)
+            self.appendix_env = not before[0]  # an appendices environment after \\appendix changes nothing
             self.flow(self.prep(n.nodelist), ctx)
             ctx.flush()
+            self.appendix, self.appendix_env = before  # the appendix package restores the section numbering at the end
         elif name in TRANSPARENT_ENVS:
             ctx.flush()
             self.flow(self.prep(n.nodelist), ctx)
@@ -265,18 +295,20 @@ class BlockMixin:
         return s.strip("\n")
 
     # ---------------------------------------------------------------------------------------
+    def start_appendix(self, loc) -> None:
+        """After \\appendix the top numbered unit (chapter or section) is lettered: the writer puts appendix
+        headings in their own style set, linked to a separate lettered list."""
+        self.appendix = True
+        if self.doc.appendix_level is not None:
+            return
+        book = self.doc.docclass in BOOK_CLASSES
+        self.doc.appendix_level = self.heading_level("chapter" if book else "section")
+        self.doc.appendix_prefix = "Appendix " if self.doc.docclass in PREFIX_CLASSES else ""
+        self.audit.add("numbering", f"\\appendix: appendix headings use the '{self.sm['paragraph']['appendix_heading']} N' "
+                       f"styles, numbered {self.doc.appendix_prefix}A, A.1, ... in a list of their own", loc, "info")
+
     def heading_level(self, name: str) -> int:
-        book = self.doc.docclass in ("report", "book", "memoir", "scrreprt", "scrbook")
-        offset = self.opts.get("heading_offset", "auto")
-        base = {"part": 1, "chapter": 1, "section": 2, "subsection": 3, "subsubsection": 4,
-                "paragraph": 5, "subparagraph": 6}[name]
-        if not book and offset == "auto":
-            base -= 1
-            if name == "part":
-                base = 1
-        elif isinstance(offset, int):
-            base += offset
-        return max(1, min(base, 9))
+        return heading_level(name, self.doc.docclass, self.opts.get("heading_offset", "auto"))
 
     def sectioning(self, n, ctx: Flow, nodes: list, i: int) -> int:
         name = n.macroname
@@ -299,7 +331,7 @@ class BlockMixin:
         if name == "part":
             self.audit.add("numbering", "\\part treated as a top-level heading", loc)
         h = Heading(level=self.heading_level(name), children=title, starred=starred,
-                    label=labels[0].key if labels else None, appendix=self.appendix, loc=loc)
+                    label=labels[0].key if labels else None, appendix=self.appendix, appendix_env=self.appendix_env, loc=loc)
         if short is not None:
             h.toc_title = plain_text(arg_nodes(short))
         ctx.out.append(h)

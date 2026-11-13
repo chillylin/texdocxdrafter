@@ -483,3 +483,171 @@ def test_inline_note_parentheses_and_spacing():
     assert text(_parenthesised([run("Knuth, The TeXbook, p. 9.")], " ")) == " (Knuth, The TeXbook, p. 9)"
     assert text(_parenthesised([run("(Knuth, The TeXbook, p. 9)")], " ")) == " (Knuth, The TeXbook, p. 9)"
     assert text(_parenthesised([run("(Knuth, p. 9)")], "")) == "(Knuth, p. 9)"
+
+
+# ---- appendix headings: their own style set and a lettered list --------------------------------------------
+
+
+def _style(xml: str, sid: str) -> str:
+    m = re.search(rf'<w:style [^>]*w:styleId="{sid}".*?</w:style>', xml, re.S)
+    return m.group(0) if m else ""
+
+
+def _heading_paras(xml: str) -> list[tuple[str, str]]:
+    out = []
+    for p in re.findall(r"<w:p[ >].*?</w:p>", xml, re.S):
+        m = re.search(r'<w:pStyle w:val="([^"]+)"', p)
+        if m and "Heading" in m.group(1):
+            out.append((m.group(1), _text(p)))
+    return out
+
+
+APPENDIX_BODY = r"""\section{Intro}\label{sec:intro}
+See Appendix~\ref{app:data} and \ref{app:sub}.
+\appendix
+\section{Data}\label{app:data}
+\subsection{Sources}\label{app:sub}
+\section*{Unnumbered}
+\section{Code}"""
+
+
+def test_appendix_headings_use_their_own_lettered_styles(tmp_path):
+    src = _doc(tmp_path, APPENDIX_BODY)
+    res = build(src, no_harvest=True, log=_quiet)
+    assert res.check.ok
+    xml = _xml(tmp_path)
+    assert _heading_paras(xml) == [("Heading1", "Intro"), ("AppendixHeading1", "Data"), ("AppendixHeading2", "Sources"),
+                                   ("AppendixHeading1", "Unnumbered"), ("AppendixHeading1", "Code")]
+    assert "REF _wf_app_data \\n \\h" in xml or "\\n \\h" in xml  # section refs stay live fields
+    styles = _xml(tmp_path, "word/styles.xml")
+    a1 = _style(styles, "AppendixHeading1")
+    assert '<w:basedOn w:val="Heading1"/>' in a1 and '<w:outlineLvl w:val="0"/>' in a1
+    num_id = re.search(r'<w:numId w:val="(\d+)"/>', a1).group(1)
+    assert num_id != "1"  # not the main heading list
+    numbering = _xml(tmp_path, "word/numbering.xml")
+    abs_id = re.search(rf'<w:num w:numId="{num_id}"><w:abstractNumId w:val="(\d+)"/>', numbering).group(1)
+    absnum = re.search(rf'<w:abstractNum w:abstractNumId="{abs_id}".*?</w:abstractNum>', numbering, re.S).group(0)
+    lvl0 = re.search(r'<w:lvl w:ilvl="0">.*?</w:lvl>', absnum, re.S).group(0)
+    assert 'w:val="upperLetter"' in lvl0 and '<w:lvlText w:val="%1"/>' in lvl0
+    assert '<w:pStyle w:val="AppendixHeading1"/>' in lvl0
+    app = [e for e in res.audit.entries if e.kind == "numbering" and "\\appendix" in e.message]
+    assert len(app) == 1 and app[0].severity == "info" and "'Appendix Heading N'" in app[0].message
+    # the content check counts appendix headings as headings
+    got = fidelity.found(tmp_path / "main.docx", stylemap.load(None))
+    assert got.headings == ["Intro", "Data", "Sources", "Unnumbered", "Code"], got.headings
+
+
+def test_no_appendix_no_appendix_styles(tmp_path):
+    src = _doc(tmp_path, "\\section{Only}\nText.")
+    build(src, no_harvest=True, log=_quiet)
+    assert "AppendixHeading" not in _xml(tmp_path, "word/styles.xml")
+
+
+def test_appendices_environment_restores_main_numbering(tmp_path):
+    src = _doc(tmp_path, r"""\section{One}
+\begin{appendices}
+\section{Extra}
+\end{appendices}
+\section{Two}""", preamble="\\usepackage{appendix}")
+    build(src, no_harvest=True, log=_quiet)
+    assert _heading_paras(_xml(tmp_path)) == [("Heading1", "One"), ("AppendixHeading1", "Extra"), ("Heading1", "Two")]
+
+
+def test_report_appendix_chapters_read_appendix_letter(tmp_path):
+    src = _doc(tmp_path, r"""\chapter{Intro}
+See Appendix~\ref{app:a} and \ref{app:a1}.
+\appendix
+\chapter{Data}\label{app:a}
+\section{Sources}\label{app:a1}""")
+    src.write_text(src.read_text().replace("{article}", "{report}"))
+    build(src, no_harvest=True, log=_quiet)
+    xml = _xml(tmp_path)
+    assert _heading_paras(xml)[1:] == [("AppendixHeading1", "Data"), ("AppendixHeading2", "Sources")]
+    numbering = _xml(tmp_path, "word/numbering.xml")
+    assert '<w:lvlText w:val="Appendix %1"/>' in numbering and '<w:suff w:val="space"/>' in numbering
+    # Word's number of the chapter would say "Appendix A": the reference is LaTeX's letter as text
+    assert "See Appendix\xa0A and " in _text(xml) and "REF _wf_app_a \\n" not in xml
+    assert "\\n \\h" in xml  # the section reference (A.1) is still a field
+
+
+def test_appendix_styles_added_to_user_template(tmp_path):
+    src = _doc(tmp_path, r"""\section{Intro}
+\appendix
+\section{Data}""")
+    build(src, no_harvest=True, log=_quiet)
+    tpl = tmp_path / "tpl.docx"
+    os.replace(tmp_path / "main.docx", tpl)
+    # a template without appendix styles: strip them from the copy
+    with zipfile.ZipFile(tpl) as z:
+        styles = z.read("word/styles.xml")
+    stripped = re.sub(rb'<w:style [^>]*w:styleId="AppendixHeading\d".*?</w:style>', b"", styles, flags=re.S)
+    _rezip(tpl, {"word/styles.xml": [(styles, stripped)]}, {})
+    res = build(src, reference_doc=tpl, no_harvest=True, overwrite=True, log=_quiet)
+    assert res.check.ok
+    assert ("AppendixHeading1", "Data") in _heading_paras(_xml(tmp_path))
+    assert '<w:basedOn w:val="Heading1"/>' in _style(_xml(tmp_path, "word/styles.xml"), "AppendixHeading1")
+    assert any("Appendix Heading 1" in e.message for e in res.audit.entries if e.kind == "style")
+
+
+def _ref_text(tmp_path, body, docclass="article", preamble="\\usepackage{cleveref}"):
+    src = _doc(tmp_path, body, preamble=preamble)
+    src.write_text(src.read_text().replace("{article}", "{" + docclass + "}"))
+    build(src, no_harvest=True, overwrite=True, log=_quiet)
+    return _text(_xml(tmp_path)).replace("\xa0", " ")
+
+
+CREF_BODY = r"""\section{Intro}\label{s:i}
+\subsection{Detail}\label{s:d}
+X: \cref{s:i}; \cref{s:d}; \cref{a:d}; \cref{a:s}; \Cref{a:d}; \cref{a:d,a:e}; \cref{s:i,a:d}; \autoref{a:d}.
+\appendix
+\section{Data}\label{a:d}
+\subsection{Sources}\label{a:s}
+\section{More}\label{a:e}"""
+
+
+def test_cref_names_appendix_headings_appendix(tmp_path):
+    t = _ref_text(tmp_path, CREF_BODY)
+    # the .aux is empty: section numbers are Word's fields, cached as "?"
+    assert ("X: section ?; section ?; appendix ?; appendix ?; Appendix ?; appendices ? and ?; "
+            "section ? and appendix ?; Appendix ?.") in t, t
+
+
+def test_cref_capitalise_option(tmp_path):
+    t = _ref_text(tmp_path, CREF_BODY, preamble="\\usepackage[capitalise]{cleveref}")
+    assert "X: Section ?; Section ?; Appendix ?; Appendix ?; Appendix ?;" in t, t
+
+
+def test_cref_in_report_appendix_chapters(tmp_path):
+    t = _ref_text(tmp_path, r"""\chapter{Intro}\label{c:i}
+\section{Part}\label{c:p}
+X: \cref{c:i}; \cref{c:p}; \cref{a:c}; \cref{a:s}; \autoref{a:c}; \autoref{c:i}.
+\appendix
+\chapter{Data}\label{a:c}
+\section{Sources}\label{a:s}""", docclass="report")
+    # an appendix chapter is LaTeX's letter as text (Word's number would read "Appendix A")
+    assert "X: chapter ?; section ?; appendix A; appendix ?; Appendix A; Chapter ?." in t, t
+
+
+# What pdflatex + hyperref + cleveref print (checked in the sandbox), for \\autoref{top}; \\cref{top}; \\cref{sub};
+# \\autoref{sub}; \\Cref{top}. Inside the appendix package's appendices environment cleveref keeps the section type.
+LATEX_REFS = {
+    ("article", False): "Appendix A; appendix A; appendix A.1; subsection A.1; Appendix A.",
+    ("article", True): "Appendix A; section A; section A.1; subsection A.1; Section A.",
+    ("report", False): "Appendix A; appendix A; appendix A.1; section A.1; Appendix A.",
+    ("report", True): "Appendix A; chapter A; section A.1; section A.1; Chapter A.",
+}
+
+
+@pytest.mark.parametrize("docclass,env", list(LATEX_REFS))
+def test_reference_words_match_latex_in_appendices(tmp_path, docclass, env):
+    top, sub = ("chapter", "section") if docclass == "report" else ("section", "subsection")
+    heads = rf"\{top}{{Data}}\label{{x:a}}\{sub}{{Src}}\label{{x:s}}"
+    body = rf"\{top}{{Intro}}" + ("\\begin{appendices}" + heads + "\\end{appendices}" if env else "\\appendix" + heads)
+    body += "\n\nR: \\autoref{x:a}; \\cref{x:a}; \\cref{x:s}; \\autoref{x:s}; \\Cref{x:a}."
+    src = _doc(tmp_path, body, preamble="\\usepackage{appendix}\\usepackage{cleveref}")
+    src.write_text(src.read_text().replace("{article}", "{" + docclass + "}"))
+    # the numbers LaTeX wrote, as a compile leaves them in the .aux
+    src.with_suffix(".aux").write_text("\\newlabel{x:a}{{A}{1}}\n\\newlabel{x:s}{{A.1}{1}}\n")
+    build(src, no_harvest=True, log=_quiet)
+    t = _text(_xml(tmp_path)).replace("\xa0", " ")
+    assert "R: " + LATEX_REFS[(docclass, env)] in t, t

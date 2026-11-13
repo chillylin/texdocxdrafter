@@ -87,6 +87,7 @@ class Heading(Node):
     starred: bool = False
     label: str | None = None
     appendix: bool = False
+    appendix_env: bool = False  # inside the appendix package's appendices environment (cleveref keeps "section")
     toc_title: str | None = None
 
 
@@ -258,6 +259,8 @@ class Document(Node):
     labels: dict = field(default_factory=dict)  # key -> (kind, loc)
     docclass: str = "article"
     has_maketitle: bool = False
+    appendix_level: int | None = None  # heading level whose number turns into a letter after \\appendix
+    appendix_prefix: str | None = None  # "Appendix " before that letter (report, book, memoir chapters)
 
 
 def to_json(obj: Any) -> Any:

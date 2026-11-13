@@ -106,7 +106,7 @@ def found(path, sm: dict) -> Manifest:
     names = _style_names(z)
     doc = etree.fromstring(z.read("word/document.xml"))
     m = Manifest()
-    heading = sm["paragraph"]["heading"].lower() + " "
+    heading = (sm["paragraph"]["heading"].lower() + " ", sm["paragraph"]["appendix_heading"].lower() + " ")
     bib_heading = sm["paragraph"]["bibliography_heading"].lower()
     bib = sm["paragraph"]["bibliography"].lower()
     for p in doc.iter(w("p")):

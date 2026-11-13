@@ -20,7 +20,10 @@ def census(doc: Document, sm: dict) -> list[tuple[str, int, str]]:
 
     def visit(n):
         if isinstance(n, Heading):
-            add(f"heading level {n.level}" + (" (unnumbered)" if n.starred else ""), f"{pm['heading']} {n.level}")
+            top = doc.appendix_level
+            style = pm["appendix_heading"] if n.appendix and top is not None and n.level >= top else pm["heading"]
+            add(f"heading level {n.level}" + (" (appendix)" if style != pm["heading"] else "")
+                + (" (unnumbered)" if n.starred else ""), f"{style} {n.level}")
         elif isinstance(n, Para):
             key = n.style or ("first_paragraph" if n.first else "body")
             add(f"paragraph ({key})", pm.get(key, key))

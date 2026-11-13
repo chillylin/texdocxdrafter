@@ -30,6 +30,7 @@ DEFAULT_PARAGRAPH = {
     "bibliography_heading": "Heading 1",
     "bibliography": "Bibliography",
     "heading": "Heading",  # Heading 1 ... Heading 9
+    "appendix_heading": "Appendix Heading",  # Appendix Heading 1 ... 9: headings after \\appendix
     "center": "Center",
     "figure": "Figure",
     "table_text_center": "Table Text Center",

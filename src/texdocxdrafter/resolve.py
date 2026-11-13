@@ -20,6 +20,8 @@ class LabelInfo:
     loc: tuple | None = None
     bookmark: str = ""
     heading: str = ""  # para labels: the label of the enclosing heading, whose number LaTeX prints
+    appendix: bool = False  # section labels: the heading follows \\appendix
+    appendix_env: bool = False  # ... inside an appendices environment, where cleveref keeps the section type
 
 
 def collect_labels(doc: Document, aux: dict[str, AuxLabel], audit: Audit) -> dict[str, LabelInfo]:
@@ -46,6 +48,9 @@ def collect_labels(doc: Document, aux: dict[str, AuxLabel], audit: Audit) -> dic
     def visit(n):
         if isinstance(n, Heading):
             add(n.label, "section", n.level, n.loc)
+            if n.label in labels and labels[n.label].kind == "section":
+                labels[n.label].appendix = n.appendix
+                labels[n.label].appendix_env = n.appendix_env
             if not n.starred:
                 last_heading[0] = n.label or ""
         elif isinstance(n, Table):

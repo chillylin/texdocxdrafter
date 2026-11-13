@@ -117,8 +117,12 @@ def _strip_num(style_el) -> None:
             ppr.remove(old)
 
 
-def build_reference(sm: dict, template: str | Path | None = None, audit: Audit | None = None):
-    """Return (Document with empty body, NumberingManager, info dict)."""
+def build_reference(sm: dict, template: str | Path | None = None, audit: Audit | None = None,
+                    appendix: tuple[int, str] | None = None):
+    """Return (Document with empty body, NumberingManager, info dict).
+
+    ``appendix`` (lettered heading level, prefix) is given when the document has an appendix: the appendix
+    heading styles are then created, each linked to a lettered list of its own."""
     user = template is not None
     try:
         doc = Document(str(template)) if user else Document()
@@ -131,7 +135,8 @@ def build_reference(sm: dict, template: str | Path | None = None, audit: Audit |
             body.remove(child)
     _scrub_template(doc)  # the built-in template too: python-docx's default carries a customXml part
 
-    paragraph_names = {v for k, v in sm["paragraph"].items() if k != "heading"} | {f"{sm['paragraph']['heading']} {i}" for i in range(1, 10)}
+    paragraph_names = {v for k, v in sm["paragraph"].items() if k not in ("heading", "appendix_heading")} | \
+        {f"{sm['paragraph']['heading']} {i}" for i in range(1, 10)}
     char_names = set(sm["character"].values())
     missing: list[str] = []
     existing = {s.name for s in doc.styles}
@@ -164,11 +169,16 @@ def build_reference(sm: dict, template: str | Path | None = None, audit: Audit |
         if name not in existing:
             _make_table_style(doc, name, rules=(name == sm["options"]["table_style"]))
             existing.add(name)
+    nm = _numbering(doc, user)
+    if appendix is not None:
+        for name in _appendix_styles(doc, sm, nm, *appendix):
+            existing.add(name)
+            if user:
+                missing.append(name)
     if user and missing and audit is not None:
         audit.add("style", f"styles missing from the reference document were created: {', '.join(sorted(set(missing)))}",
                   severity="warn")
 
-    nm = _numbering(doc, user)
     if not user:
         _link_styles(doc, nm)
     return doc, nm, {"user_template": user, "missing": missing}
@@ -354,6 +364,29 @@ def _numbering(doc, user: bool) -> NumberingManager:
                           headings=False)
     nm.preserve = True
     return nm
+
+
+def _appendix_styles(doc, sm: dict, nm: NumberingManager, top: int, prefix: str) -> list[str]:
+    """Create "Appendix Heading 1..9", each based on the matching heading style and numbered by a lettered list
+    of its own, so Word numbers the appendix A, A.1 while the main headings keep 1, 1.1. A style the template
+    already defines is left as it is. Returns the names created."""
+    base, name = sm["paragraph"]["heading"], sm["paragraph"]["appendix_heading"]
+    todo = {i: f"{name} {i}" for i in range(1, 10) if _find(doc, f"{name} {i}") is None}
+    if not todo:
+        return []
+    num = nm.appendix_num(top, prefix, {i - 1: style_id(n) for i, n in todo.items()})
+    body = _find(doc, sm["paragraph"]["body"])
+    nxt = f'<w:next w:val="{body.get(qn("w:styleId"))}"/>' if body is not None else ""
+    styles = doc.styles.element
+    for i, n in todo.items():
+        parent = _find(doc, f"{base} {i}")
+        based = f'<w:basedOn w:val="{parent.get(qn("w:styleId"))}"/>' if parent is not None else ""
+        styles.append(parse_xml(
+            f'<w:style {NS} w:type="paragraph" w:customStyle="1" w:styleId="{style_id(n)}">'
+            f'<w:name w:val="{_attr(n)}"/>{based}{nxt}<w:uiPriority w:val="9"/><w:qFormat/>'
+            f'<w:pPr><w:keepNext/><w:keepLines/><w:numPr><w:ilvl w:val="{i - 1}"/><w:numId w:val="{num}"/></w:numPr>'
+            f'<w:outlineLvl w:val="{i - 1}"/></w:pPr></w:style>'))
+    return list(todo.values())
 
 
 def _link_styles(doc, nm: NumberingManager) -> None:
