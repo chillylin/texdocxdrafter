@@ -23,6 +23,7 @@ from ..parser.model import (
 from ..preflight import fingerprint
 from ..parser.blocks import heading_unit
 from ..refdoc import build_reference
+from . import fieldcache
 from . import images as gfx
 from . import math as omml
 from .textmath import text_math
@@ -118,7 +119,7 @@ class DocxWriter:
         self.heading_count = Counter()
         opts = next((o for n, o in pf.packages if n == "cleveref"), "")
         self.cref_capitalise = bool(re.search(r"\bcapitali[sz]e\b", opts or ""))
-        self._letters: dict | None = None  # appendix chapter label -> letter, computed on first use
+        self._letters: dict | None = None
         self.rev_stack: list[str] = []
         cols = self.sm["options"].get("columns", "auto")
         self.columns = (2 if pf.two_column else 1) if cols == "auto" else int(cols)
@@ -1275,8 +1276,16 @@ class DocxWriter:
             self.audit.add("other", f"{xmlutil.STRIPPED[0]} control character(s) that XML cannot carry were dropped "
                            "from the text", severity="info")
         self.nm.apply(self.d.part.numbering_part.element)
+        # every REF result is filled in as Word would compute it, so Word need not update fields on open (which
+        # makes it ask about "fields that may refer to other files"); a template's request for that goes too
+        pagerefs = fieldcache.fill_results([self.body] + self.footnotes, self.body,
+                                           self.d.part.numbering_part.element, self.d.styles.element)
         settings = self.d.settings.element
-        _insert_settings(settings, el("w:updateFields", {"w:val": "true"}), after=("w:zoom", "w:removePersonalInformation"))
+        for old in settings.findall(q("w:updateFields")):
+            settings.remove(old)
+        if pagerefs:
+            self.audit.add("numbering", f"{pagerefs} page reference(s) (\\pageref) show LaTeX's page numbers; in Word, "
+                           "select all and press F9 to show Word's")
         cp = self.d.core_properties
         if self.doc.title:
             cp.title = xml_safe("".join(_inline_text(self.doc.title)))

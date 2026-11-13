@@ -263,8 +263,7 @@ def _scrub_template(doc) -> None:
 
 # Fields a header or footer may keep: they are computed from the document itself. Everything else goes,
 # in particular INCLUDETEXT, INCLUDEPICTURE, LINK, DDE, DDEAUTO, IMPORT, RD, DATABASE and AUTOTEXT, which
-# make Word fetch local or remote content when the fields are updated, and the writer asks for exactly
-# that (updateFields) so that its own REF and SEQ fields show the right numbers.
+# make Word fetch local or remote content when the fields are updated (F9, or printing).
 _SAFE_FIELDS = frozenset("""PAGE NUMPAGES SECTIONPAGES SECTION DATE TIME CREATEDATE SAVEDATE PRINTDATE EDITTIME
 TITLE AUTHOR SUBJECT KEYWORDS COMMENTS REVNUM NUMWORDS NUMCHARS STYLEREF SEQ REF PAGEREF NOTEREF
 TOC INDEX XE TC SYMBOL HYPERLINK QUOTE IF COMPARE SET FORMULA = LISTNUM AUTONUM AUTONUMLGL AUTONUMOUT

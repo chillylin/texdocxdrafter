@@ -607,14 +607,14 @@ X: \cref{s:i}; \cref{s:d}; \cref{a:d}; \cref{a:s}; \Cref{a:d}; \cref{a:d,a:e}; \
 
 def test_cref_names_appendix_headings_appendix(tmp_path):
     t = _ref_text(tmp_path, CREF_BODY)
-    # the .aux is empty: section numbers are Word's fields, cached as "?"
-    assert ("X: section ?; section ?; appendix ?; appendix ?; Appendix ?; appendices ? and ?; "
-            "section ? and appendix ?; Appendix ?.") in t, t
+    # the .aux is empty: the numbers are the field results the writer computes from the document
+    assert ("X: section 1; section 1.1; appendix A; appendix A.1; Appendix A; appendices A and B; "
+            "section 1 and appendix A; Appendix A.") in t, t
 
 
 def test_cref_capitalise_option(tmp_path):
     t = _ref_text(tmp_path, CREF_BODY, preamble="\\usepackage[capitalise]{cleveref}")
-    assert "X: Section ?; Section ?; Appendix ?; Appendix ?; Appendix ?;" in t, t
+    assert "X: Section 1; Section 1.1; Appendix A; Appendix A.1; Appendix A;" in t, t
 
 
 def test_cref_in_report_appendix_chapters(tmp_path):
@@ -625,7 +625,7 @@ X: \cref{c:i}; \cref{c:p}; \cref{a:c}; \cref{a:s}; \autoref{a:c}; \autoref{c:i}.
 \chapter{Data}\label{a:c}
 \section{Sources}\label{a:s}""", docclass="report")
     # an appendix chapter is LaTeX's letter as text (Word's number would read "Appendix A")
-    assert "X: chapter ?; section ?; appendix A; appendix ?; Appendix A; Chapter ?." in t, t
+    assert "X: chapter 1; section 1.1; appendix A; appendix A.1; Appendix A; Chapter 1." in t, t
 
 
 # What pdflatex + hyperref + cleveref print (checked in the sandbox), for \\autoref{top}; \\cref{top}; \\cref{sub};
@@ -651,3 +651,101 @@ def test_reference_words_match_latex_in_appendices(tmp_path, docclass, env):
     build(src, no_harvest=True, log=_quiet)
     t = _text(_xml(tmp_path)).replace("\xa0", " ")
     assert "R: " + LATEX_REFS[(docclass, env)] in t, t
+
+
+# ---- field results filled in by the writer: no field update (and no Word prompt) on open ----------------------
+
+
+def _field_results(xml: str) -> dict[str, str]:
+    """instruction -> cached result text, for every complex field in a part."""
+    out = {}
+    for m in re.finditer(r'fldCharType="begin"/>.*?<w:instrText[^>]*>([^<]*)</w:instrText>.*?fldCharType="separate"/>'
+                         r'(.*?)fldCharType="end"/>', xml, re.S):
+        out[m.group(1).strip()] = _text(m.group(2))
+    return out
+
+
+FIELDS_BODY = r"""\section{Intro}\label{s:intro}
+Forward: \ref{fig:b}, \ref{s:det}, \ref{a:sub}, \nameref{s:det}, item \ref{it:two}, eq \eqref{eq:one}.
+\subsection{Details}\label{s:det}
+\begin{enumerate}\item one \item two\label{it:two}\end{enumerate}
+\begin{figure}\includegraphics{pic}\caption{First}\end{figure}
+\begin{figure}\includegraphics{pic}\caption{Second}\label{fig:b}\end{figure}
+\begin{equation}a=b\label{eq:one}\end{equation}
+\appendix
+\section{Data}
+\subsection{More}\label{a:sub}"""
+
+
+def test_field_results_are_filled_without_an_aux(tmp_path):
+    """The .aux is empty: every REF result comes from the document itself, as Word would compute it."""
+    src = _doc(tmp_path, FIELDS_BODY)
+    res = build(src, no_harvest=True, log=_quiet)
+    assert res.check.ok
+    f = _field_results(_xml(tmp_path))
+    assert f["REF _wf_fig_b \\h"] == "2", f  # a forward reference to the second figure
+    assert f["REF _wf_s_det \\n \\h"] == "1.1", f  # a subsection: the full number, no trailing period
+    assert f["REF _wf_s_det \\h"] == "Details", f  # \\nameref: the title, which the .aux number never was
+    assert f["REF _wf_a_sub \\n \\h"] == "A.1", f  # the appendix list
+    assert f["REF _wf_it_two \\n \\h"] == "2", f  # an enumerate item ("2." without its period)
+    assert f["REF _wf_eq_one \\h"] == "1", f
+    settings = _xml(tmp_path, "word/settings.xml")
+    assert "updateFields" not in settings
+
+
+def test_pageref_is_reported_not_updated_on_open(tmp_path):
+    src = _doc(tmp_path, "\\section{A}\\label{s:a}\nSee page \\pageref{s:a}.")
+    res = build(src, no_harvest=True, log=_quiet)
+    assert "updateFields" not in _xml(tmp_path, "word/settings.xml")
+    assert any("press F9" in e.message and "\\pageref" in e.message for e in res.audit.entries), \
+        [e.message for e in res.audit.entries]
+
+
+def test_no_pageref_no_f9_line(tmp_path):
+    src = _doc(tmp_path, "\\section{A}\\label{s:a}\nSee \\ref{s:a}.")
+    res = build(src, no_harvest=True, log=_quiet)
+    assert not any("press F9" in e.message for e in res.audit.entries)
+    assert _field_results(_xml(tmp_path)) == {"REF _wf_s_a \\n \\h": "1"}
+
+
+def test_template_update_fields_request_is_dropped(tmp_path):
+    src = _doc(tmp_path, "\\section{A}\nText.")
+    build(src, no_harvest=True, log=_quiet)
+    tpl = tmp_path / "tpl.docx"
+    os.replace(tmp_path / "main.docx", tpl)
+    with zipfile.ZipFile(tpl) as z:
+        settings = z.read("word/settings.xml")
+    at = settings.index(b"</w:settings>")
+    _rezip(tpl, {"word/settings.xml": [(settings, settings[:at] + b'<w:updateFields w:val="true"/>' + settings[at:])]}, {})
+    build(src, reference_doc=tpl, no_harvest=True, overwrite=True, log=_quiet)
+    assert "updateFields" not in _xml(tmp_path, "word/settings.xml")
+
+
+def test_i1_item_references_stay_fields_with_words_number(tmp_path):
+    """I1/J1: LaTeX's references to a nested item and to an item labelled "\\roman*." read "2a" and "i."; Word's
+    list number gives "(a)" and "i". The references stay live fields with Word's number, so they renumber when a
+    coauthor edits the list (README, Known limits), and no item reference is written as text."""
+    src = _doc(tmp_path, r"""\begin{enumerate}
+\item one
+\item two\label{it:two}
+  \begin{enumerate}\item sub\label{it:sub}\end{enumerate}
+\end{enumerate}
+\begin{enumerate}[label=\roman*.]
+\item first\label{it:rom}
+\end{enumerate}
+See \ref{it:two}, \ref{it:sub} and \ref{it:rom}.""", preamble="\\usepackage{enumitem}")
+    src.with_suffix(".aux").write_text("\\relax\n\\newlabel{it:two}{{2}{1}}\n\\newlabel{it:sub}{{2a}{1}}\n"
+                                       "\\newlabel{it:rom}{{{{i.}}}{1}{}{}{}}\n")  # as enumitem writes it
+    res = build(src, no_harvest=True, log=_quiet)
+    assert res.check.ok
+    f = _field_results(_xml(tmp_path))
+    assert f == {"REF _wf_it_two \\n \\h": "2", "REF _wf_it_sub \\n \\h": "(a)", "REF _wf_it_rom \\n \\h": "i"}, f
+    assert not [e for e in res.audit.entries if "list item" in e.message]
+
+
+def test_i1_without_a_current_aux_item_references_stay_fields(tmp_path):
+    """No LaTeX number to honour: Word's own number, as a live field."""
+    src = _doc(tmp_path, r"""\begin{enumerate}\item two\begin{enumerate}\item sub\label{it:sub}\end{enumerate}\end{enumerate}
+See \ref{it:sub}.""")
+    build(src, no_harvest=True, log=_quiet)
+    assert _field_results(_xml(tmp_path)) == {"REF _wf_it_sub \\n \\h": "(a)"}

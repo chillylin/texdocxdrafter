@@ -34,7 +34,9 @@ Good luck.
 What you get:
 
 - Every structural element uses a named Word style (Heading 1, Body Text, Caption Table, Bibliography, ...).
-- Headings, table and figure captions, and equations use Word's own auto-numbering.
+- Headings, table and figure captions, and equations use Word's own auto-numbering. Appendix headings get
+  their own style set ("Appendix Heading 1", ...) and a lettered list (A, A.1; "Appendix A" for the chapters
+  of report, book and memoir), so the main and the appendix numbering are each set once in Word.
 - `\ref`, `\cref`, `\autoref`, `\eqref` and `\pageref` become live REF/PAGEREF fields.
 - Citations and the reference list are rendered by the real biblatex or BibTeX (italics, punctuation, style)
   and inserted as plain formatted text. There are no Zotero or Word citation fields.
@@ -98,9 +100,10 @@ If `main.docx` already exists and is not byte-for-byte a file this tool wrote (f
 has saved it), the build stops rather than overwrite it. Pass `-o other.docx` or `--overwrite`. The same
 protection covers the report.
 
-In Word, press `Ctrl+A` then `F9` to refresh all fields (`texdocxdrafter` also sets "update fields on open", so
-Word may ask whether to update them). After that, inserting or moving a section renumbers headings,
-captions, equations and every cross-reference.
+The cross-references open with the numbers Word itself gives the targets, so the docx does not ask Word to
+update fields on opening and Word does not ask about "fields that may refer to other files". After you insert
+or move a section in Word, press `Ctrl+A` then `F9`: headings, captions, equations and every cross-reference
+renumber.
 
 ## Side compiles
 
@@ -349,8 +352,9 @@ reads only regular files there, never through a symbolic link, and creates its o
   the document itself survive (`PAGE`, `NUMPAGES`, dates, `STYLEREF`, `REF`, `SEQ` and the like); fields that
   make Word fetch other files or URLs (`INCLUDETEXT`, `INCLUDEPICTURE`, `LINK`, `DDE`, `MERGEFIELD`, …) or
   show your file path (`FILENAME`), alternate-format chunks, sub-documents, embedded objects and controls, and
-  externally linked pictures are removed, as are mail-merge settings and their data sources, because the docx
-  asks Word to update all fields on opening so that its own cross-references show the right numbers. The page
+  externally linked pictures are removed, as are mail-merge settings and their data sources, because Word
+  runs them whenever you update fields (`F9`, or before printing if Word is set to). A template's "update
+  fields on open" setting is removed too. The page
   background and its fill, web-layout frames, the view setting and editing or write protection are removed too.
   Hyperlinks in its headers and footers follow the same rule as the tool's own links: `http`, `https` and
   `mailto` targets stay links, anything else (network shares, `file:`, `javascript:`, relative paths) becomes
@@ -389,7 +393,15 @@ contents of table cells, citations (the harvest line gives their count), metadat
 
 ## Known limits
 
-- Appendix headings keep numeric numbering in Word (flagged in the report). Where LaTeX's figure, table or
+- Cross-references show Word's numbering of the target and stay fields that renumber when the document is
+  edited. Where LaTeX prints a reference differently, the docx shows Word's form: a reference to a nested
+  list item reads "(a)" where the PDF says "2a", and one to an item labelled `\roman*.` reads "i" where the
+  PDF says "i.". Word cannot do this the LaTeX way: a cross-reference always shows the number exactly as
+  the list item displays it. A `\ref` to an appendix chapter of report, book or memoir is its letter as
+  text, since Word's number for it includes the word "Appendix". `\pageref` shows LaTeX's page numbers
+  until you press `F9` in Word (reported), since pages exist only once Word lays the document out. Cleveref names follow cleveref's English defaults ("appendix A",
+  "section 1.1"); `\crefname` changes are not read.
+- Where LaTeX's figure, table or
   equation number (from the `.aux`) is a plain integer that differs from Word's running count, after
   `\setcounter` or `subequations` for instance, the SEQ field resets Word's sequence to LaTeX's number. Not
   when the `.aux` is stale (older than a source, or lacking a label of the document): then Word counts on
