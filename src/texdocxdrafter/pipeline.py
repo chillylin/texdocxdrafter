@@ -404,7 +404,7 @@ def publish(items: list[tuple]) -> None:
     """Commit several files as one step: ``items`` are (path, data, snapshot, what) as for ``commit_file``.
 
     If any commit fails, the files already written are put back: a replaced file gets its previous content,
-    a created file is removed. The three files of a build (report, docx, registry) therefore change together
+    a created file is removed. The three files of a build (docx, report, registry) therefore change together
     or not at all, as far as a sequence of renames allows; a crash between two of them is the residual."""
     done: list[tuple[Path, bytes | None]] = []
     try:
@@ -422,12 +422,17 @@ def publish(items: list[tuple]) -> None:
                 else:
                     write_atomic(path, previous)
                 restored.append(path.name)
+            except PreflightError as e2:  # _replace: Windows refused, e.g. a scanner holds the file just written
+                failed.append(f"{path.name} ({(e2.__cause__ and e2.__cause__.strerror) or 'access refused'})")
             except OSError as e2:
                 failed.append(f"{path.name} ({e2.strerror or e2})")
         if failed:
-            raise PublishError(f"publishing failed ({exc}); {', '.join(failed)} could not be put back and still "
-                               f"hold the new build" + (f", {', '.join(restored)} were restored" if restored else "")
-                               + "; when the problem is fixed, rerun with --overwrite to bring them in line") from exc
+            reason = str(exc).split("; if it is open in another program")[0]  # the advice is given once, below
+            raise PublishError(f"publishing failed: {reason}. Putting the earlier files back failed too: "
+                               f"{', '.join(failed)} could not be put back and {'holds' if len(failed) == 1 else 'hold'} "
+                               "the new build" + (f", {', '.join(restored)} restored" if restored else "")
+                               + ". Close any program that has these files open (Word, a virus scanner, a sync "
+                               "client), then rerun with --overwrite to bring them in line") from exc
         raise
 
 
@@ -588,8 +593,9 @@ def build(main, out=None, style_map=None, reference_doc=None, link_citations=Fal
         report_text = audit.render(pf.main.name, stylemap=sm, style_usage=dict(chk.paragraph_styles)).encode("utf-8")
         reg[str(report)] = hashlib.sha256(report_text).hexdigest()
         reg[str(out)] = hashlib.sha256(data).hexdigest()
-        # report, docx, registry as one step: on a failure the ones already written are put back
-        publish([(report, report_text, snaps[report], "report"), (out, data, snaps[out], "output"), registry.staged()])
+        # docx, report, registry as one step: on a failure the ones already written are put back. The docx goes
+        # first: it is the file Word holds open, and refusing it before anything was written leaves nothing to undo
+        publish([(out, data, snaps[out], "output"), (report, report_text, snaps[report], "report"), registry.staged()])
         registry.snapshot = _sha256(registry.path)
     finally:
         pf.workdir = config_dir

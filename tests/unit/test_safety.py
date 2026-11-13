@@ -1784,3 +1784,64 @@ def test_paragraph_of_many_line_breaks_strips_in_linear_time():
     items = [LineBreak() for _ in range(600_000)] + [Text(text=" x ")] + [LineBreak() for _ in range(600_000)]
     out = _bounded(lambda: strip_inlines(items), 10)
     assert len(out) == 1 and out[0].text == "x"
+
+
+# ---- G1: a Windows refusal while publishing ----------------------------------------------------------------
+
+
+def _windows_lock(monkeypatch, locked: set):
+    """os.replace refuses, as Windows does for a file another program holds open, any target named in ``locked``."""
+    real = os.replace
+
+    def replace(src, dst):
+        if Path(dst).name in locked:
+            raise PermissionError(13, "Access is denied")
+        return real(src, dst)
+
+    monkeypatch.setattr(pipeline.os, "replace", replace)
+
+
+def test_g1_docx_open_in_word_changes_nothing_and_a_rerun_goes_through(tmp_path, monkeypatch):
+    """The docx is committed first: when Word holds it, nothing has been written yet and a plain rerun works."""
+    from test_publish import PART, _digests, _no_temp_files, _project, _quiet
+
+    src = _project(tmp_path)
+    build(src, no_harvest=True, log=_quiet)
+    (tmp_path / "part.tex").write_text(PART + "A new sentence so the docx changes.\n")
+    before = _digests(tmp_path)
+    _windows_lock(monkeypatch, {"main.docx"})
+    with pytest.raises(PreflightError, match=r"main\.docx.*open in another program"):
+        build(src, no_harvest=True, log=_quiet)
+    assert _digests(tmp_path) == before
+    _no_temp_files(tmp_path)
+    monkeypatch.undo()
+    assert build(src, no_harvest=True, log=_quiet).check.ok  # no --overwrite needed
+
+
+def test_g1_refused_restore_is_reported_with_the_original_failure(tmp_path, monkeypatch):
+    """The docx was replaced, the report is refused, and putting the old docx back is refused too: the error names
+    both files and says which one holds the new build, instead of a bare 'close it and rerun' about one of them."""
+    from test_publish import PART, _project, _quiet
+
+    src = _project(tmp_path)
+    build(src, no_harvest=True, log=_quiet)
+    (tmp_path / "part.tex").write_text(PART + "A new sentence so the docx changes.\n")
+    real = os.replace
+    calls = []
+
+    def replace(src_, dst):
+        name = Path(dst).name
+        calls.append(name)
+        if name.endswith("report.md") or (name == "main.docx" and calls.count("main.docx") > 1):
+            raise PermissionError(13, "Access is denied")
+        return real(src_, dst)
+
+    monkeypatch.setattr(pipeline.os, "replace", replace)
+    with pytest.raises(pipeline.PublishError) as ei:
+        build(src, no_harvest=True, log=_quiet)
+    msg = str(ei.value)
+    assert "cannot replace report" in msg and "Close any program that has these files open" in msg, msg
+    assert msg.count("rerun") == 1  # one instruction, not "close it and rerun" followed by "rerun with --overwrite"
+    assert "main.docx" in msg and "could not be put back" in msg and "--overwrite" in msg, msg
+    monkeypatch.undo()
+    assert build(src, no_harvest=True, overwrite=True, log=_quiet).check.ok

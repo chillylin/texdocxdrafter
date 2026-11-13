@@ -161,7 +161,7 @@ def test_failed_rollback_is_reported_not_swallowed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pipeline, "commit_file", failing)
     monkeypatch.setattr(pipeline, "write_atomic", lambda p, d: (_ for _ in ()).throw(OSError(errno.ENOSPC, "still full")))
-    with pytest.raises(PublishError, match="a.txt .* could not be put back and still hold the new build") as info:
+    with pytest.raises(PublishError, match="a.txt .* could not be put back and holds the new build") as info:
         pipeline.publish([(a, b"new a", snap_a, "report"), (b, b"new b", None, "output")])
     assert "--overwrite" in str(info.value) and isinstance(info.value.__cause__, OSError)
     assert "b.txt" not in str(info.value).split("could not be put back")[0]  # R7: only the files not restored are named
